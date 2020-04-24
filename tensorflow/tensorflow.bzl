@@ -1604,6 +1604,7 @@ def _py_wrap_cc_impl(ctx):
         outputs = outputs,
         mnemonic = "PythonSwig",
         progress_message = "SWIGing " + src.path,
+        use_default_shell_env = True,
     )
     return struct(files = depset(outputs))
 
