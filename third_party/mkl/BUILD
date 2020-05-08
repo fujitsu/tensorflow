@@ -65,18 +65,18 @@ cc_library(
     name = "intel_binary_blob",
     visibility = ["//visibility:public"],
     deps = select({
-        "@org_tensorflow//tensorflow:linux_x86_64": [
-            "@mkl_linux//:mkl_headers",
-            "@mkl_linux//:mkl_libs_linux",
-        ],
-        "@org_tensorflow//tensorflow:macos": [
-            "@mkl_darwin//:mkl_headers",
-            "@mkl_darwin//:mkl_libs_darwin",
-        ],
-        "@org_tensorflow//tensorflow:windows": [
-            "@mkl_windows//:mkl_headers",
-            "@mkl_windows//:mkl_libs_windows",
-        ],
+        #"@org_tensorflow//tensorflow:linux_x86_64": [
+        #    "@mkl_linux//:mkl_headers",
+        #    "@mkl_linux//:mkl_libs_linux",
+        #],
+        #"@org_tensorflow//tensorflow:macos": [
+        #    "@mkl_darwin//:mkl_headers",
+        #    "@mkl_darwin//:mkl_libs_darwin",
+        #],
+        #"@org_tensorflow//tensorflow:windows": [
+        #    "@mkl_windows//:mkl_headers",
+        #    "@mkl_windows//:mkl_libs_windows",
+        #],
         "//conditions:default": [],
     }),
 )

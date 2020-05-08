@@ -132,16 +132,16 @@ def tf_repositories(path_prefix = "", tf_repo_name = ""):
     # MKL-DNN might require upgrading MKL ML libraries also. If they need to be
     # upgraded then update the version numbers on all three versions above
     # (Linux, Mac, Windows).
-    tf_http_archive(
-        name = "mkl_dnn",
-        build_file = clean_dep("//third_party/mkl_dnn:mkldnn.BUILD"),
-        sha256 = "ed56652dd237deb86ee9bf102c18de5f2625c059e5ab1d7512c8dc01e316b694",
-        strip_prefix = "mkl-dnn-0.21.2",
-        urls = [
-            "https://storage.googleapis.com/mirror.tensorflow.org/github.com/intel/mkl-dnn/archive/v0.21.2.tar.gz",
-            "https://github.com/intel/mkl-dnn/archive/v0.21.2.tar.gz",
-        ],
-    )
+    #tf_http_archive(
+    #    name = "mkl_dnn",
+    #    build_file = clean_dep("//third_party/mkl_dnn:mkldnn.BUILD"),
+    #    sha256 = "ed56652dd237deb86ee9bf102c18de5f2625c059e5ab1d7512c8dc01e316b694",
+    #    strip_prefix = "mkl-dnn-0.21.2",
+    #    urls = [
+    #        "https://storage.googleapis.com/mirror.tensorflow.org/github.com/intel/mkl-dnn/archive/v0.21.2.tar.gz",
+    #        "https://github.com/intel/mkl-dnn/archive/v0.21.2.tar.gz",
+    #    ],
+    #)
 
     tf_http_archive(
         name = "mkl_dnn_v1",

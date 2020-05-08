@@ -145,3 +145,19 @@ http_archive(
         "https://storage.googleapis.com/download.tensorflow.org/models/speech_commands_v0.01.zip",
     ],
 )
+
+new_local_repository(
+    name = "mkl_dnn",
+    path = "/INSTALL_PATH/oneDNN",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+cc_library(
+    name = "mkl_dnn",
+    hdrs = glob(["include/*"]),
+    includes = ["include",
+                "build/include",],
+    linkopts = ["-L/INSTALL_PATH/oneDNN/build/src -lmkldnn",],
+
+)
+"""
+)
