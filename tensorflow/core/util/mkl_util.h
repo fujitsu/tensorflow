@@ -1998,7 +1998,8 @@ class FactoryKeyCreator {
 static inline MEMORY_FORMAT get_desired_format(int channel, bool is_2d = true) {
   MEMORY_FORMAT fmt_desired = MEMORY_FORMAT::any;
 
-  if (port::TestCPUFeature(port::CPUFeature::AVX512F)) {
+  //if (port::TestCPUFeature(port::CPUFeature::AVX512F)) {
+  if (1) {  // for using nChw16c at aarch64
     fmt_desired = is_2d ? MEMORY_FORMAT::nChw16c : MEMORY_FORMAT::nCdhw16c;
   } else if (port::TestCPUFeature(port::CPUFeature::AVX2) &&
              (channel % 8) == 0) {
