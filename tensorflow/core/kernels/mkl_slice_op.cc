@@ -358,8 +358,7 @@ class MklSliceOp : public OpKernel {
 
     // Though MKL-DNN supports more than 8 dimension and
     // less than 12 dimension tensor.
-    // But we are mimicking functionality of Eigen Slice op for CPU.
-    if (begin.size() >= 8) {
+    if (begin.size() >= 12) {
       OP_REQUIRES(
           context, false,
           errors::Unimplemented("MklSliceOp : Unhandled input dimensions"));
