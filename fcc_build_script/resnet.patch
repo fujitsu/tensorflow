@@ -1,0 +1,294 @@
+commit e70135494d2a5b9b2f2a312d8a779c24b9d43639
+Author: Tatsuya Fukushi <fukushi.tatsuya@jp.fujitsu.com>
+Date:   Thu Oct 15 04:04:24 2020 +0000
+
+    aaply horovod
+
+diff --git a/official/r1/resnet/imagenet_main.py b/official/r1/resnet/imagenet_main.py
+index bbff51dc..1be322fe 100644
+--- a/official/r1/resnet/imagenet_main.py
++++ b/official/r1/resnet/imagenet_main.py
+@@ -29,6 +29,10 @@ from official.r1.resnet import resnet_model
+ from official.r1.resnet import resnet_run_loop
+ from official.utils.flags import core as flags_core
+ from official.utils.logs import logger
++try:
++  import horovod.tensorflow as hvd
++except ImportError:
++  pass
+ 
+ DEFAULT_IMAGE_SIZE = 224
+ NUM_CHANNELS = 3
+@@ -48,16 +52,24 @@ DATASET_NAME = 'ImageNet'
+ # Data processing
+ ###############################################################################
+ def get_filenames(is_training, data_dir):
++  tf.compat.v1.logging.info('horovod-dev enter get_filenames')
+   """Return filenames for dataset."""
++  def split_files_hvd(filenames):
++    if resnet_run_loop.horovod_is_valid():
++      filenames = [filenames[i::hvd.size()] for i in range(hvd.size())]
++      return filenames[hvd.rank()]
++    else:
++      return filenames
+   if is_training:
+-    return [
+-        os.path.join(data_dir, 'train-%05d-of-01024' % i)
+-        for i in range(_NUM_TRAIN_FILES)]
++    filenames = [
++      os.path.join(data_dir, 'train-%05d-of-01024' % i)
++      for i in range(_NUM_TRAIN_FILES)]
++    return split_files_hvd(filenames)
+   else:
+-    return [
+-        os.path.join(data_dir, 'validation-%05d-of-00128' % i)
+-        for i in range(128)]
+-
++    filenames = [
++      os.path.join(data_dir, 'validation-%05d-of-00128' % i)
++      for i in range(128)]
++    return split_files_hvd(filenames)
+ 
+ def _parse_example_proto(example_serialized):
+   """Parses an Example proto containing a training example of an image.
+@@ -190,6 +202,7 @@ def input_fn(is_training,
+     A dataset that can be used for iteration.
+   """
+   filenames = get_filenames(is_training, data_dir)
++  tf.compat.v1.logging.info("horovod-dev filenames is %s", filenames)
+   dataset = tf.data.Dataset.from_tensor_slices(filenames)
+ 
+   if input_context:
+@@ -200,8 +213,12 @@ def input_fn(is_training,
+                             input_context.input_pipeline_id)
+ 
+   if is_training:
++    if resnet_run_loop.horovod_is_valid():
++      num_train_files = _NUM_TRAIN_FILES // hvd.size()
++    else:
++      num_train_files = _NUM_TRAIN_FILES
+     # Shuffle the input files
+-    dataset = dataset.shuffle(buffer_size=_NUM_TRAIN_FILES)
++    dataset = dataset.shuffle(buffer_size=num_train_files)
+ 
+   # Convert to individual records.
+   # cycle_length = 10 means that up to 10 files will be read and deserialized in
+@@ -212,6 +229,9 @@ def input_fn(is_training,
+       cycle_length=10,
+       num_parallel_calls=tf.data.experimental.AUTOTUNE)
+ 
++  if resnet_run_loop.horovod_is_valid():
++    _NUM_IMAGES['train'] = _NUM_IMAGES['train'] // hvd.size()
++
+   return resnet_run_loop.process_record_dataset(
+       dataset=dataset,
+       is_training=is_training,
+diff --git a/official/r1/resnet/resnet_run_loop.py b/official/r1/resnet/resnet_run_loop.py
+index 72d0e6cd..0e67b533 100644
+--- a/official/r1/resnet/resnet_run_loop.py
++++ b/official/r1/resnet/resnet_run_loop.py
+@@ -39,6 +39,22 @@ from official.utils.logs import hooks_helper
+ from official.utils.logs import logger
+ from official.utils.misc import distribution_utils
+ from official.utils.misc import model_helpers
++hvd_valid = False
++try:
++  import horovod.tensorflow as hvd
++  tf.compat.v1.logging.info('horovod-dev find horovod')
++  hvd_valid = True
++
++except ImportError:
++  pass
++
++#
++# Functions for horovod
++#
++def horovod_is_valid():
++  if hvd_valid and flags.FLAGS.horovod:
++    tf.compat.v1.logging.info('horovod-dev horovod mode is on')
++  return hvd_valid and flags.FLAGS.horovod
+ 
+ 
+ ################################################################################
+@@ -438,7 +454,13 @@ def resnet_model_fn(features, labels, mode, model_class,
+   if mode == tf.estimator.ModeKeys.TRAIN:
+     global_step = tf.compat.v1.train.get_or_create_global_step()
+ 
+-    learning_rate = learning_rate_fn(global_step)
++    # Horovod: adjust learning rate based on number of GPUs.
++    if horovod_is_valid():
++      tf.compat.v1.logging.info("horovod-dev hvd.size : %d", hvd.size())
++      learning_rate = learning_rate_fn(global_step * hvd.size()) / hvd.size() 
++      #learning_rate = learning_rate_fn(global_step) / hvd.size() 
++    else:
++      learning_rate = learning_rate_fn(global_step)
+ 
+     # Create a tensor named learning_rate for logging purposes
+     tf.identity(learning_rate, name='learning_rate')
+@@ -462,6 +484,11 @@ def resnet_model_fn(features, labels, mode, model_class,
+           tf.compat.v1.train.experimental.enable_mixed_precision_graph_rewrite(
+               optimizer, loss_scale=loss_scale))
+ 
++    # Horovod: add Horovod Distributed Optimizer.
++    if horovod_is_valid():
++      tf.compat.v1.logging.info("horovod-dev optimizer = hvd.DistributedOptimizer(optimizer)")
++      optimizer = hvd.DistributedOptimizer(optimizer)
++
+     def _dense_grad_filter(gvs):
+       """Only apply gradient updates to the final layer.
+ 
+@@ -542,7 +569,22 @@ def resnet_main(
+     `train_hooks` is a list the instances of hooks used during training.
+   """
+ 
+-  model_helpers.apply_clean(flags.FLAGS)
++  # Horovod: initialize Horovod.
++  if horovod_is_valid():
++    tf.compat.v1.logging.info("horovod-dev hvd.init()")
++    hvd.init()
++
++  if horovod_is_valid():
++    tf.compat.v1.logging.info("horovod-dev hvd.rank : %d", hvd.rank())
++    model_helpers.apply_clean(flags.FLAGS, hvd.rank())
++    tf.compat.v1.logging.info("horovod-dev model_helpers.apply_clean")
++    '''
++    if hvd.rank() == 0:
++      model_helpers.apply_clean(flags.FLAGS)
++      tf.compat.v1.logging.info("horovod-dev model_helpers.apply_clean")
++    '''
++  else:
++    model_helpers.apply_clean(flags.FLAGS)
+ 
+   # Ensures flag override logic is only executed if explicitly triggered.
+   if flags_obj.tf_gpu_thread_mode:
+@@ -569,6 +611,7 @@ def resnet_main(
+   # Creates a `RunConfig` that checkpoints every 24 hours which essentially
+   # results in checkpoints determined only by `epochs_between_evals`.
+   run_config = tf.estimator.RunConfig(
++      log_step_count_steps=1,
+       train_distribute=distribution_strategy,
+       session_config=session_config,
+       save_checkpoints_secs=60*60*24,
+@@ -582,8 +625,29 @@ def resnet_main(
+   else:
+     warm_start_settings = None
+ 
++  # Horovod: save checkpoints only on worker 0 to prevent other workers from
++  # corrupting them.
++  if horovod_is_valid():
++    model_dir = flags_obj.model_dir + str(hvd.rank())
++    tf.compat.v1.logging.info("horovod-dev model_dir = %s" % model_dir)
++
++    '''
++    if hvd.rank() == 0:
++      model_dir = flags_obj.model_dir
++      tf.compat.v1.logging.info("horovod-dev model_dir = flags_obj.model_dir")
++    else:
++      if flags_obj.eval_only:
++        model_dir = flags_obj.model_dir + str(hvd.rank())
++        tf.compat.v1.logging.info("horovod-dev model dir = %s" % model_dir)
++      else:
++        model_dir = None
++        tf.compat.v1.logging.info("horovod-dev model_dir = None")
++  '''
++  else:
++    model_dir = flags_obj.model_dir
++
+   classifier = tf.estimator.Estimator(
+-      model_fn=model_function, model_dir=flags_obj.model_dir, config=run_config,
++      model_fn=model_function, model_dir=model_dir, config=run_config,
+       warm_start_from=warm_start_settings, params={
+           'resnet_size': int(flags_obj.resnet_size),
+           'data_format': flags_obj.data_format,
+@@ -614,10 +678,18 @@ def resnet_main(
+ 
+   train_hooks = hooks_helper.get_train_hooks(
+       flags_obj.hooks,
+-      model_dir=flags_obj.model_dir,
++      model_dir=model_dir,
+       batch_size=flags_obj.batch_size)
+ 
+   def input_fn_train(num_epochs, input_context=None):
++    # Horovod: BroadcastGlobalVariablesHook broadcasts initial variable states
++    # from rank 0 to all other processes. This is necessary to ensure consistent
++    # initialization of all workers when training is started with random weights
++    # or restored from a checkpoint.
++    if horovod_is_valid():
++      tf.compat.v1.logging.info("horovod-dev train_hooks.append(hvd.BroadcastGlobalVariablesHook(0))")
++      train_hooks.append(hvd.BroadcastGlobalVariablesHook(0))
++
+     return input_function(
+         is_training=True,
+         data_dir=flags_obj.data_dir,
+@@ -692,7 +764,20 @@ def resnet_main(
+       # to terminate.  Note that eval will run for max_train_steps each loop,
+       # regardless of the global_step count.
+       tf.compat.v1.logging.info('Starting to evaluate.')
++
++      from tensorflow.python.training.session_run_hook import SessionRunHook
++      import time
++      class TimeHook(SessionRunHook):
++        def begin(self):
++          self.start = 0
++          self.step_ = 0
++        def before_run(self, run_context): self.start = time.time()
++        def after_run(self, run_context, run_values):
++            self.step_ = self.step_ + 1
++            tf.compat.v1.logging.info('step = %d time = %.3f [sec]', self.step_, (time.time()-self.start))
++
+       eval_results = classifier.evaluate(input_fn=input_fn_eval,
++                                         hooks=[TimeHook()],
+                                          steps=flags_obj.max_train_steps)
+ 
+       benchmark_logger.log_evaluation_result(eval_results)
+diff --git a/official/utils/flags/_base.py b/official/utils/flags/_base.py
+index 176f10bb..203994ea 100644
+--- a/official/utils/flags/_base.py
++++ b/official/utils/flags/_base.py
+@@ -28,7 +28,7 @@ from official.utils.logs import hooks_helper
+ def define_base(data_dir=True, model_dir=True, clean=False, train_epochs=False,
+                 epochs_between_evals=False, stop_threshold=False,
+                 batch_size=True, num_gpu=False, hooks=False, export_dir=False,
+-                distribution_strategy=False, run_eagerly=False):
++                distribution_strategy=False, run_eagerly=False, horovod=True):
+   """Register base flags.
+ 
+   Args:
+@@ -149,6 +149,12 @@ def define_base(data_dir=True, model_dir=True, clean=False, train_epochs=False,
+                        "according to the number of GPUs.")
+     )
+ 
++  #horovod
++  if horovod:
++    flags.DEFINE_boolean(
++        name="horovod", default=False, short_name="hvd",
++        help=help_wrap("If set, horovod on"))
++    key_flags.append("horovod")
+ 
+   return key_flags
+ 
+diff --git a/official/utils/misc/model_helpers.py b/official/utils/misc/model_helpers.py
+index c112bacd..5333ef8f 100644
+--- a/official/utils/misc/model_helpers.py
++++ b/official/utils/misc/model_helpers.py
+@@ -86,8 +86,16 @@ def generate_synthetic_data(
+   return tf.data.Dataset.from_tensors(element).repeat()
+ 
+ 
+-def apply_clean(flags_obj):
+-  if flags_obj.clean and tf.io.gfile.exists(flags_obj.model_dir):
++def apply_clean(flags_obj, hvdrank=None):
++  if flags_obj.model_dir is None:
++    return
++
++  if hvdrank is None:
++    model_dir = flags_obj.model_dir
++  else:
++    model_dir = flags_obj.model_dir + str(hvdrank)
++
++  if flags_obj.clean and tf.io.gfile.exists(model_dir):
+     tf.compat.v1.logging.info("--clean flag set. Removing existing model dir:"
+-                              " {}".format(flags_obj.model_dir))
+-    tf.io.gfile.rmtree(flags_obj.model_dir)
++                              " {}".format(model_dir))
++    tf.io.gfile.rmtree(model_dir)
