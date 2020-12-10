@@ -1,3 +1,9 @@
+This repository provides TensorFlow tuned for A64FX.
+
+Please See the [wiki](https://github.com/fujitsu/tensorflow/wiki) for details.
+
+--------------------------------------------------------------------------------
+
 <div align="center">
   <img src="https://www.tensorflow.org/images/tf_logo_social.png">
 </div>
