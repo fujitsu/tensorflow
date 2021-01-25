@@ -8,7 +8,7 @@
 
 set -ex
 
-. ./env.src
+. ../../env.src
 . $INSTALL_PATH/$VENV_NAME/bin/activate
 
 export HOROVOD_MPI_THREADS_DISABLE=1

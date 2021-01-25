@@ -8,7 +8,7 @@
 
 set -ex
 
-. ./env.src
+. ../../env.src
 . $INSTALL_PATH/$VENV_NAME/bin/activate
 
 export HOROVOD_MPI_THREADS_DISABLE=1
@@ -23,6 +23,7 @@ cd official/r1/resnet
 
 PROC=4
 MPI="mpirun -np $PROC"
+#MPI="mpirun --prefix /opt/FJSVstclanga/v1.1.0 --hostfile $WORK_PATH/hostfile -mca pml ob1"
 INTER="-inter=1"
 #INTRA="-intra=1"
 HOROVOD="--horovod=True"

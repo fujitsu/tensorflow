@@ -7,13 +7,15 @@
 
 set -ex
 
-. ./env.src
+. ../../env.src
+
+PATCH=`pwd`/resnet.patch
 
 pushd $INSTALL_PATH
 
 git clone http://github.com/tensorflow/models
 cd models
 git checkout v2.0
-patch -p1 < $PREFIX/resnet.patch
+patch -p1 < $PATCH
 
 popd
