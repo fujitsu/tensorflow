@@ -114,6 +114,20 @@ http_archive(
     ],
 )
 
+new_local_repository(
+    name = "bblas",
+    path = "/INSTALL_PATH/batchedblas/",
+    build_file_content = """
+package(default_visibility = ["//visibility:public"])
+cc_library(
+    name = "bblas",
+    hdrs = glob(["*.h"]),
+    includes = [".",],
+    defines = ["_CBLAS_",],
+    linkopts = ["-L/INSTALL_PATH/batchedblas -lbatched_blas", "-lfjlapackexsve"],
+)
+"""
+)
 # Required for dependency @com_github_grpc_grpc
 
 load("@com_github_grpc_grpc//bazel:grpc_deps.bzl", "grpc_deps")

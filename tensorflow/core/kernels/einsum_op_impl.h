@@ -560,7 +560,11 @@ struct EinsumHelper {
   // when the matrix shape is [1,1]; in this case BatchMatMul functor would be
   // very inefficient. The functor should detect if this is the case and perform
   // componentwise multiplication functor instead.
-  template <typename Device, typename T>
+  template <typename Device, 
+            typename T,
+            typename std::enable_if<(!std::is_same<T, float>::value &&
+                                    !std::is_same<T, double>::value), 
+            int>::type = 0>
   static Status ContractOperands(OpKernelContext* ctx,
                                  absl::Span<const Tensor> inputs,
                                  absl::Span<const bool> swap_free_and_contract,
@@ -604,6 +608,109 @@ struct EinsumHelper {
                                          &output_reshaped);
     return Status::OK();
   }
+
+  template <typename Device, 
+            typename T,
+            typename std::enable_if<((std::is_same<T, float>::value || 
+                                    std::is_same<T, double>::value) &&
+                                    std::is_same<Device, CPUDevice>::value), 
+                                    int>::type = 0>
+  static Status ContractOperands(OpKernelContext* ctx,
+                                 absl::Span<const Tensor> inputs,
+                                 absl::Span<const bool> swap_free_and_contract,
+                                 Tensor* output) {
+    if (inputs.size() == 1)
+      return CopyFrom(inputs[0], inputs[0].shape(), output);
+
+    MatMulBCast bcast(inputs[0].shape().dim_sizes(),
+                      inputs[1].shape().dim_sizes());
+    if (!bcast.IsValid()) {
+      return errors::InvalidArgument(
+          "Invalid broadcasting dimensions: ", inputs[0].shape().DebugString(),
+          " vs. ", inputs[1].shape().DebugString());
+    }
+    const Tensor& lhs = inputs[0];
+    const Tensor& rhs = inputs[1];
+    const int ndims_lhs = lhs.dims();
+    const int ndims_rhs = rhs.dims();
+
+    TensorShape output_shape = bcast.output_batch_shape();
+    auto batch_size = bcast.output_batch_size();
+    auto lhs_rows = lhs.dim_size(ndims_lhs - 2);
+    auto lhs_cols = lhs.dim_size(ndims_lhs - 1);
+    auto rhs_rows = rhs.dim_size(ndims_rhs - 2);
+    auto rhs_cols = rhs.dim_size(ndims_rhs - 1);
+    
+    bool adj_x = swap_free_and_contract[0];
+    bool adj_y = !swap_free_and_contract[1];
+    if (adj_x) std::swap(lhs_rows, lhs_cols);
+    if (adj_y) std::swap(rhs_rows, rhs_cols);
+
+    if (lhs_cols != rhs_rows) {
+      return errors::InvalidArgument(
+          "lhs mismatch rhs shape: ", lhs_cols, " vs. ", rhs_rows,
+                ": ", lhs.shape().DebugString(), " ",
+                rhs.shape().DebugString(), " ", adj_x, " ", adj_y);
+    }
+    output_shape.AddDim(lhs_rows);
+    output_shape.AddDim(rhs_cols);
+    TF_RETURN_IF_ERROR(
+        ctx->allocate_temp(DataTypeToEnum<T>::value, output_shape, output));
+    if (lhs.NumElements() == 0 || rhs.NumElements() == 0) {
+      functor::SetZeroFunctor<Device, T> set_zero;
+      set_zero(ctx->eigen_device<Device>(), output->flat<T>());
+      return Status::OK();
+    }
+
+    auto rhs_reshaped = rhs.template flat_inner_dims<T, 3>();
+    auto lhs_reshaped = lhs.template flat_inner_dims<T, 3>();
+    auto output_reshaped = output->template flat_inner_dims<T, 3>();
+
+    const uint64 M = lhs_reshaped.dimension(adj_x ? 2 : 1);
+    const uint64 K = lhs_reshaped.dimension(adj_x ? 1 : 2);
+    const uint64 N = rhs_reshaped.dimension(adj_y ? 1 : 2);
+
+    std::vector<int> m_array(batch_size, M);
+    std::vector<int> n_array(batch_size, N);
+    std::vector<int> k_array(batch_size, K);
+    std::vector<int> lda_array(batch_size, adj_x ? M : K);
+    std::vector<int> ldb_array(batch_size, adj_y ? K : N);
+    std::vector<int> ldc_array(batch_size, N);
+    std::vector<int> group_size(1, batch_size);
+    std::vector<const T*> a_array;
+    std::vector<const T*> b_array;
+    std::vector<T*> c_array;
+    a_array.reserve(batch_size);
+    b_array.reserve(batch_size);
+    c_array.reserve(batch_size);
+
+    if (!bcast.IsBroadcastingRequired()) {
+      for (int64 i = 0; i < batch_size; i++) {
+        a_array.push_back(&lhs_reshaped(i, 0, 0));
+        b_array.push_back(&rhs_reshaped(i, 0, 0));
+        c_array.push_back(&output_reshaped(i, 0, 0));
+      }
+    } else {
+      // Broadcasting is needed, so get the mapping from flattened output batch
+      // indices to x's and y's flattened batch indices.
+      const std::vector<int64>& a_batch_indices = bcast.x_batch_indices();
+      const std::vector<int64>& b_batch_indices = bcast.y_batch_indices();
+
+      for (int64 i = 0; i < batch_size; i++) {
+        a_array.push_back(&lhs_reshaped(a_batch_indices[i], 0, 0));
+        b_array.push_back(&rhs_reshaped(b_batch_indices[i], 0, 0));
+        c_array.push_back(&output_reshaped(i, 0, 0));
+      }
+    }
+
+    BblasGemmBatch(CblasRowMajor, adj_x, adj_y, m_array, n_array, k_array,
+                      &a_array[0], lda_array, &b_array[0], ldb_array,
+                      &c_array[0], ldc_array, 1, group_size);
+
+
+    return Status::OK();
+  }
+
 };
 
 template <typename Device, typename T>

@@ -3992,7 +3992,7 @@ tf_kernel_library(
     # <prefix>*impl.h are excluded by default from the CPU build, add explicitly.
     hdrs = ["batch_matmul_op_impl.h"],
     prefix = "batch_matmul_op",
-    deps = MATH_DEPS + [":eigen_contraction_kernel"] + if_mkl_ml([
+    deps = ["@bblas"] + MATH_DEPS + [":eigen_contraction_kernel"] + if_mkl_ml([
         "//third_party/mkl:intel_binary_blob",
     ]),
 )

@@ -21,7 +21,9 @@ limitations under the License.
 #define EIGEN_USE_THREADS
 
 #include <vector>
-
+extern "C"{
+  #include "bblas.h"
+}
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
@@ -582,83 +584,218 @@ struct LaunchBatchMatMul<SYCLDevice, Scalar> {
 };
 #endif  // TENSORFLOW_USE_SYCL
 
+/*
+template <typename T,
+          typename std::enable_if<(std::is_same<T, float>::value ||
+                                  std::is_same<T, double>::value),
+                                  int>::type = 0>
+                                  */
+template <typename T>
+void BblasGemmBatch(const CBLAS_LAYOUT Layout, const bool TransA,
+                         const bool TransB, const std::vector<int>& M_Array,
+                         const std::vector<int>& N_Array,
+                         const std::vector<int>& K_Array, const T** A_Array,
+                         const std::vector<int>& lda_Array,
+                         const T** B_Array,
+                         const std::vector<int>& ldb_Array, T** C_Array,
+                         const std::vector<int>& ldc_Array,
+                         const int group_count,
+                         const std::vector<int>& group_size) {
+  std::vector<CBLAS_TRANSPOSE> TransA_Array(
+      group_size[0], TransA ? CblasTrans : CblasNoTrans);
+  std::vector<CBLAS_TRANSPOSE> TransB_Array(
+      group_size[0], TransB ? CblasTrans : CblasNoTrans);
+  if (std::is_same<T, float>::value) {
+    std::vector<float> alpha_Array(group_size[0], 1.0);
+    std::vector<float> beta_Array(group_size[0], 0.0);
+    if(group_size[0] == 1) {    // batch_size == 1
+      cblas_sgemm(Layout, TransA_Array[0], TransB_Array[0], M_Array[0], 
+                  N_Array[0], K_Array[0], alpha_Array[0], reinterpret_cast<const float**>(A_Array)[0], 
+                  lda_Array[0], reinterpret_cast<const float**>(B_Array)[0], ldb_Array[0],
+                  beta_Array[0], reinterpret_cast<float**>(C_Array)[0], ldc_Array[0]);
+    } else {
+      cblas_sgemm_batch(Layout, &TransA_Array[0], &TransB_Array[0], &M_Array[0],
+                        &N_Array[0], &K_Array[0], &alpha_Array[0],
+                        reinterpret_cast<const float**>(A_Array), &lda_Array[0],
+                        reinterpret_cast<const float**>(B_Array), &ldb_Array[0],
+                        &beta_Array[0], reinterpret_cast<float**>(C_Array),
+                        &ldc_Array[0], group_count, &group_size[0]);
+    }
+      
+  } else {
+    std::vector<double> alpha_Array(group_size[0], 1.0);
+    std::vector<double> beta_Array(group_size[0], 0.0);
+    if(group_size[0] == 1) {   // batch_size == 1
+      cblas_dgemm(Layout, TransA_Array[0], TransB_Array[0], M_Array[0], 
+                  N_Array[0], K_Array[0], alpha_Array[0], reinterpret_cast<const double**>(A_Array)[0], 
+                  lda_Array[0], reinterpret_cast<const double**>(B_Array)[0], ldb_Array[0],
+                  beta_Array[0], reinterpret_cast<double**>(C_Array)[0], ldc_Array[0]);
+    } else {
+      cblas_dgemm_batch(
+          Layout, &TransA_Array[0], &TransB_Array[0], &M_Array[0], &N_Array[0],
+          &K_Array[0], &alpha_Array[0],
+          reinterpret_cast<const double**>(A_Array), &lda_Array[0],
+          reinterpret_cast<const double**>(B_Array), &ldb_Array[0],
+          &beta_Array[0], reinterpret_cast<double**>(C_Array), &ldc_Array[0],
+          group_count, &group_size[0]);
+    } 
+  }
+}
+
 template <typename Device, typename Scalar>
 class BaseBatchMatMulOp : public OpKernel {
  public:
-  explicit BaseBatchMatMulOp(OpKernelConstruction* context)
-      : OpKernel(context) {
+  explicit BaseBatchMatMulOp(OpKernelConstruction* context) : OpKernel(context) {
     OP_REQUIRES_OK(context, context->GetAttr("adj_x", &adj_x_));
     OP_REQUIRES_OK(context, context->GetAttr("adj_y", &adj_y_));
   }
 
-  ~BaseBatchMatMulOp() override {}
+  virtual ~BaseBatchMatMulOp() {}
 
   void Compute(OpKernelContext* ctx) override {
-    const Tensor& in0 = ctx->input(0);
-    const Tensor& in1 = ctx->input(1);
+    const Tensor& lhs = ctx->input(0);
+    const Tensor& rhs = ctx->input(1);
 
-    ValidateInputTensors(ctx, in0, in1);
+    ValidateInputTensors(ctx, lhs, rhs);
+    // lhs and rhs can have different dimensions
+    const int ndims_lhs = lhs.dims();
+    const int ndims_rhs = rhs.dims();
 
-    MatMulBCast bcast(in0.shape().dim_sizes(), in1.shape().dim_sizes());
+    // Get broadcast info
+    MatMulBCast bcast(lhs.shape().dim_sizes(), rhs.shape().dim_sizes());
     OP_REQUIRES(
         ctx, bcast.IsValid(),
         errors::InvalidArgument(
             "In[0] and In[1] must have compatible batch dimensions: ",
-            in0.shape().DebugString(), " vs. ", in1.shape().DebugString()));
+            lhs.shape().DebugString(), " vs. ", rhs.shape().DebugString()));
 
     TensorShape out_shape = bcast.output_batch_shape();
     auto batch_size = bcast.output_batch_size();
-    auto d0 = in0.dim_size(in0.dims() - 2);
-    auto d1 = in0.dim_size(in0.dims() - 1);
-    Tensor in0_reshaped;
-    OP_REQUIRES(
-        ctx,
-        in0_reshaped.CopyFrom(in0, TensorShape({bcast.x_batch_size(), d0, d1})),
-        errors::Internal("Failed to reshape In[0] from ",
-                         in0.shape().DebugString()));
-    auto d2 = in1.dim_size(in1.dims() - 2);
-    auto d3 = in1.dim_size(in1.dims() - 1);
-    Tensor in1_reshaped;
-    OP_REQUIRES(
-        ctx,
-        in1_reshaped.CopyFrom(in1, TensorShape({bcast.y_batch_size(), d2, d3})),
-        errors::Internal("Failed to reshape In[1] from ",
-                         in1.shape().DebugString()));
-    if (adj_x_) std::swap(d0, d1);
-    if (adj_y_) std::swap(d2, d3);
-    OP_REQUIRES(ctx, d1 == d2,
-                errors::InvalidArgument(
-                    "In[0] mismatch In[1] shape: ", d1, " vs. ", d2, ": ",
-                    in0.shape().DebugString(), " ", in1.shape().DebugString(),
-                    " ", adj_x_, " ", adj_y_));
-    out_shape.AddDim(d0);
-    out_shape.AddDim(d3);
-    Tensor* out = nullptr;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
-    if (out->NumElements() == 0) {
-      return;
+
+    if (std::is_same<Scalar, float>::value || std::is_same<Scalar, double>::value) { 
+      auto lhs_rows = lhs.dim_size(ndims_lhs - 2);
+      auto lhs_cols = lhs.dim_size(ndims_lhs - 1);
+      auto rhs_rows = rhs.dim_size(ndims_rhs - 2);
+      auto rhs_cols = rhs.dim_size(ndims_rhs - 1);
+
+      if (adj_x_) std::swap(lhs_rows, lhs_cols);
+      if (adj_y_) std::swap(rhs_rows, rhs_cols);
+      OP_REQUIRES(ctx, lhs_cols == rhs_rows,
+                  errors::InvalidArgument(
+                    "lhs mismatch rhs shape: ", lhs_cols, " vs. ", rhs_rows,
+                    ": ", lhs.shape().DebugString(), " ",
+                    rhs.shape().DebugString(), " ", adj_x_, " ", adj_y_));
+
+      out_shape.AddDim(lhs_rows);
+      out_shape.AddDim(rhs_cols);
+
+      Tensor* out = nullptr;
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
+      if (out->NumElements() == 0) {
+        return;
+      }
+      if (lhs.NumElements() == 0 || rhs.NumElements() == 0) {
+        functor::SetZeroFunctor<Device, Scalar> f;
+        f(ctx->eigen_device<Device>(), out->flat<Scalar>());
+        return;
+      }
+
+      auto rhs_reshaped = rhs.template flat_inner_dims<Scalar, 3>();
+      auto lhs_reshaped = lhs.template flat_inner_dims<Scalar, 3>();
+      auto out_reshaped = out->template flat_inner_dims<Scalar, 3>();
+      const uint64 M = lhs_reshaped.dimension(adj_x_ ? 2 : 1);
+      const uint64 K = lhs_reshaped.dimension(adj_x_ ? 1 : 2);
+      const uint64 N = rhs_reshaped.dimension(adj_y_ ? 1 : 2);
+
+      std::vector<int> m_array(batch_size, M);
+      std::vector<int> n_array(batch_size, N);
+      std::vector<int> k_array(batch_size, K);
+      std::vector<int> lda_array(batch_size, adj_x_ ? M : K);
+      std::vector<int> ldb_array(batch_size, adj_y_ ? K : N);
+      std::vector<int> ldc_array(batch_size, N);
+      std::vector<int> group_size(1, batch_size);
+      std::vector<const Scalar*> a_array;
+      std::vector<const Scalar*> b_array;
+      std::vector<Scalar*> c_array;
+      a_array.reserve(batch_size);
+      b_array.reserve(batch_size);
+      c_array.reserve(batch_size);
+
+      if (!bcast.IsBroadcastingRequired()) {
+        for (int64 i = 0; i < batch_size; i++) {
+          a_array.push_back(&lhs_reshaped(i, 0, 0));
+          b_array.push_back(&rhs_reshaped(i, 0, 0));
+          c_array.push_back(&out_reshaped(i, 0, 0));
+        }
+      } else {
+        // Broadcasting is needed, so get the mapping from flattened output batch
+        // indices to x's and y's flattened batch indices.
+        const std::vector<int64>& a_batch_indices = bcast.x_batch_indices();
+        const std::vector<int64>& b_batch_indices = bcast.y_batch_indices();
+
+        for (int64 i = 0; i < batch_size; i++) {
+          a_array.push_back(&lhs_reshaped(a_batch_indices[i], 0, 0));
+          b_array.push_back(&rhs_reshaped(b_batch_indices[i], 0, 0));
+          c_array.push_back(&out_reshaped(i, 0, 0));
+        }
+      }
+
+      BblasGemmBatch(CblasRowMajor, adj_x_, adj_y_, m_array, n_array, k_array,
+                        &a_array[0], lda_array, &b_array[0], ldb_array,
+                        &c_array[0], ldc_array, 1, group_size);
+    } else {
+      auto d0 = lhs.dim_size(lhs.dims() - 2);
+      auto d1 = lhs.dim_size(lhs.dims() - 1);
+      Tensor lhs_reshaped;
+      OP_REQUIRES(
+            ctx,
+            lhs_reshaped.CopyFrom(lhs, TensorShape({bcast.x_batch_size(), d0, d1})),
+            errors::Internal("Failed to reshape In[0] from ",
+                            lhs.shape().DebugString()));
+      auto d2 = rhs.dim_size(rhs.dims() - 2);
+      auto d3 = rhs.dim_size(rhs.dims() - 1);
+      Tensor rhs_reshaped;
+      OP_REQUIRES(
+          ctx,
+          rhs_reshaped.CopyFrom(rhs, TensorShape({bcast.y_batch_size(), d2, d3})),
+          errors::Internal("Failed to reshape In[1] from ",
+                          rhs.shape().DebugString()));
+      if (adj_x_) std::swap(d0, d1);
+      if (adj_y_) std::swap(d2, d3);
+      OP_REQUIRES(ctx, d1 == d2,
+                  errors::InvalidArgument(
+                      "In[0] mismatch In[1] shape: ", d1, " vs. ", d2, ": ",
+                      lhs.shape().DebugString(), " ", rhs.shape().DebugString(),
+                      " ", adj_x_, " ", adj_y_));
+      out_shape.AddDim(d0);
+      out_shape.AddDim(d3);
+      Tensor* out = nullptr;
+      OP_REQUIRES_OK(ctx, ctx->allocate_output(0, out_shape, &out));
+      if (out->NumElements() == 0) {
+        return;
+      }
+      if (lhs.NumElements() == 0 || rhs.NumElements() == 0) {
+        functor::SetZeroFunctor<Device, Scalar> f;
+        f(ctx->eigen_device<Device>(), out->flat<Scalar>());
+        return;
+      }
+      Tensor out_reshaped;
+      OP_REQUIRES(ctx,
+                  out_reshaped.CopyFrom(*out, TensorShape({batch_size, d0, d3})),
+                  errors::Internal("Failed to reshape output from ",
+                                  out->shape().DebugString()));
+      LaunchBatchMatMul<Device, Scalar>::Launch(
+          ctx, lhs_reshaped, rhs_reshaped, adj_x_, adj_y_, bcast, &out_reshaped);
     }
-    if (in0.NumElements() == 0 || in1.NumElements() == 0) {
-      functor::SetZeroFunctor<Device, Scalar> f;
-      f(ctx->eigen_device<Device>(), out->flat<Scalar>());
-      return;
-    }
-    Tensor out_reshaped;
-    OP_REQUIRES(ctx,
-                out_reshaped.CopyFrom(*out, TensorShape({batch_size, d0, d3})),
-                errors::Internal("Failed to reshape output from ",
-                                 out->shape().DebugString()));
-    LaunchBatchMatMul<Device, Scalar>::Launch(
-        ctx, in0_reshaped, in1_reshaped, adj_x_, adj_y_, bcast, &out_reshaped);
   }
 
  protected:
-  virtual void ValidateInputTensors(OpKernelContext* ctx, const Tensor& in0,
-                                    const Tensor& in1) = 0;
+  virtual void ValidateInputTensors(OpKernelContext* ctx, const Tensor& in0, const Tensor& in1) = 0;
 
  private:
   bool adj_x_;
   bool adj_y_;
+
 };
 
 // BatchMatMul Op implementation which disallows broadcasting.
@@ -715,6 +852,8 @@ class BatchMatMulV2Op : public BaseBatchMatMulOp<Device, Scalar> {
         errors::InvalidArgument("In[1] ndims must be >= 2: ", in1.dims()));
   }
 };
+
+
 
 #define REGISTER_BATCH_MATMUL_CPU(TYPE)                                   \
   REGISTER_KERNEL_BUILDER(                                                \
