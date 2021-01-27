@@ -1,0 +1,47 @@
+--- download_glue_data.py.1	2021-01-26 17:15:26.437201380 +0900
++++ download_glue_data.py	2021-01-26 17:28:39.093000054 +0900
+@@ -24,6 +24,7 @@ import argparse
+ import tempfile
+ import urllib.request
+ import zipfile
++import io
+ 
+ TASKS = ["CoLA", "SST", "MRPC", "QQP", "STS", "MNLI", "QNLI", "RTE", "WNLI", "diagnostic"]
+ TASK2PATH = {"CoLA":'https://dl.fbaipublicfiles.com/glue/data/CoLA.zip',
+@@ -34,7 +35,8 @@ TASK2PATH = {"CoLA":'https://dl.fbaipubl
+              "QNLI":'https://dl.fbaipublicfiles.com/glue/data/QNLIv2.zip',
+              "RTE":'https://dl.fbaipublicfiles.com/glue/data/RTE.zip',
+              "WNLI":'https://dl.fbaipublicfiles.com/glue/data/WNLI.zip',
+-             "diagnostic":'https://dl.fbaipublicfiles.com/glue/data/AX.tsv'}
++             "diagnostic":'https://dl.fbaipublicfiles.com/glue/data/AX.tsv',
++             "MRPC": 'https://dl.fbaipublicfiles.com/glue/data/mrpc_dev_ids.tsv'}
+ 
+ MRPC_TRAIN = 'https://dl.fbaipublicfiles.com/senteval/senteval_data/msr_paraphrase_train.txt'
+ MRPC_TEST = 'https://dl.fbaipublicfiles.com/senteval/senteval_data/msr_paraphrase_test.txt'
+@@ -62,8 +64,8 @@ def format_mrpc(data_dir, path_to_data):
+         try:
+             mrpc_train_file = os.path.join(mrpc_dir, "msr_paraphrase_train.txt")
+             mrpc_test_file = os.path.join(mrpc_dir, "msr_paraphrase_test.txt")
+-            URLLIB.urlretrieve(MRPC_TRAIN, mrpc_train_file)
+-            URLLIB.urlretrieve(MRPC_TEST, mrpc_test_file)
++            urllib.request.urlretrieve(MRPC_TRAIN, mrpc_train_file)
++            urllib.request.urlretrieve(MRPC_TEST, mrpc_test_file)
+         except urllib.error.HTTPError:
+             print("Error downloading MRPC")
+             return
+@@ -79,7 +81,7 @@ def format_mrpc(data_dir, path_to_data):
+             test_fh.write("%d\t%s\t%s\t%s\t%s\n" % (idx, id1, id2, s1, s2))
+ 
+     try:
+-        URLLIB.urlretrieve(TASK2PATH["MRPC"], os.path.join(mrpc_dir, "dev_ids.tsv"))
++        urllib.request.urlretrieve(TASK2PATH["MRPC"], os.path.join(mrpc_dir, "dev_ids.tsv"))
+     except KeyError or urllib.error.HTTPError:
+         print("\tError downloading standard development IDs for MRPC. You will need to manually split your data.")
+         return
+@@ -147,4 +149,4 @@ def main(arguments):
+ 
+ 
+ if __name__ == '__main__':
+-    sys.exit(main(sys.argv[1:]))
+\ No newline at end of file
++    sys.exit(main(sys.argv[1:]))

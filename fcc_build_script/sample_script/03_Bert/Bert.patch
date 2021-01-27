@@ -1,0 +1,72 @@
+diff --git a/official/nlp/bert/run_pretraining.py b/official/nlp/bert/run_pretraining.py
+index b7d28fb4..f904b9f1 100644
+--- a/official/nlp/bert/run_pretraining.py
++++ b/official/nlp/bert/run_pretraining.py
+@@ -31,7 +31,7 @@ from official.nlp.bert import common_flags
+ from official.nlp.bert import configs
+ from official.nlp.bert import input_pipeline
+ from official.utils.misc import distribution_utils
+-
++from official.utils.misc import keras_utils
+ 
+ flags.DEFINE_string('input_files', None,
+                     'File path to retrieve training data for pre-training.')
+@@ -48,7 +48,6 @@ flags.DEFINE_integer('num_steps_per_epoch', 1000,
+                      'Total number of training steps to run per epoch.')
+ flags.DEFINE_float('warmup_steps', 10000,
+                    'Warmup steps for Adam weight decay optimizer.')
+-
+ common_flags.define_common_bert_flags()
+ common_flags.define_gin_flags()
+ 
+@@ -94,13 +93,13 @@ def run_customized_training(strategy,
+                             initial_lr,
+                             warmup_steps,
+                             input_files,
+-                            train_batch_size):
++                            train_batch_size,
++                            custom_callbacks=None):
+   """Run BERT pretrain model training using low-level API."""
+ 
+   train_input_fn = get_pretrain_dataset_fn(input_files, max_seq_length,
+                                            max_predictions_per_seq,
+                                            train_batch_size)
+-
+   def _get_pretrain_model():
+     """Gets a pretraining model."""
+     pretrain_model, core_model = bert_models.pretrain_model(
+@@ -123,7 +122,8 @@ def run_customized_training(strategy,
+       steps_per_epoch=steps_per_epoch,
+       steps_per_loop=steps_per_loop,
+       epochs=epochs,
+-      sub_model_export_name='pretrained/bert_model')
++      sub_model_export_name='pretrained/bert_model',
++      custom_callbacks=custom_callbacks)
+ 
+   return trained_model
+ 
+@@ -138,6 +138,14 @@ def run_bert_pretrain(strategy):
+   # Runs customized training loop.
+   logging.info('Training using customized training loop TF 2.0 with distrubuted'
+                'strategy.')
++  if FLAGS.log_steps:
++    custom_callbacks = [keras_utils.TimeHistory(
++        batch_size=FLAGS.train_batch_size,
++        log_steps=FLAGS.log_steps,
++        logdir=FLAGS.model_dir,
++    )]
++  else:
++    custom_callbacks = None
+ 
+   performance.set_mixed_precision_policy(common_flags.dtype())
+ 
+@@ -153,7 +161,8 @@ def run_bert_pretrain(strategy):
+       FLAGS.learning_rate,
+       FLAGS.warmup_steps,
+       FLAGS.input_files,
+-      FLAGS.train_batch_size)
++      FLAGS.train_batch_size,
++      custom_callbacks=custom_callbacks)
+ 
+ 
+ def main(_):
