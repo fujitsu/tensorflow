@@ -1,0 +1,43 @@
+data:
+  eval_features_file: train_data/toy-ende/src-val.txt
+  eval_labels_file: train_data/toy-ende/tgt-val.txt
+  source_vocabulary: train_data/toy-ende/src-vocab.txt
+  target_vocabulary: train_data/toy-ende/tgt-vocab.txt
+  train_features_file: train_data/toy-ende/src-train.txt
+  train_labels_file: train_data/toy-ende/tgt-train.txt
+eval:
+  batch_size: 32
+  steps: 10000
+infer:
+  batch_size: 32
+  length_bucket_width: 5
+model_dir: run/
+params:
+  average_loss_in_time: true
+  beam_width: 4
+  decay_params:
+    model_dim: 512
+    warmup_steps: 8000
+  decay_type: NoamDecay
+  label_smoothing: 0.1
+  learning_rate: 2.0
+  num_hypotheses: 1
+  optimizer: Adam
+  optimizer_params:
+    beta_1: 0.9
+    beta_2: 0.998
+  dropout: 0.1
+score:
+  batch_size: 64
+train:
+  average_last_checkpoints: 8
+  batch_size: 6144
+  batch_type: tokens
+  effective_batch_size: 6144
+  keep_checkpoint_max: 8
+  length_bucket_width: 1
+  max_step: 30
+  maximum_features_length: 100
+  maximum_labels_length: 100
+  sample_buffer_size: -1
+  save_summary_steps: 1

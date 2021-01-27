@@ -1,0 +1,19 @@
+commit 88369bd27cf8c5fd8d83574157a097aa557d499b
+Author: Tatsuya Fukushi <fukushi.tatsuya@fujitsu.com>
+Date:   Tue Sep 8 08:19:17 2020 +0000
+
+    do not using ctransrate
+
+diff --git a/setup.py b/setup.py
+index 230d8bc2..83e95c9c 100644
+--- a/setup.py
++++ b/setup.py
+@@ -43,7 +43,7 @@ setup(
+     keywords="tensorflow opennmt nmt neural machine translation",
+     python_requires='>=3.5',
+     install_requires=[
+-        "ctranslate2>=1.7,<2;platform_system=='Linux'",
++        #"ctranslate2>=1.7,<2;platform_system=='Linux'",
+         "pyonmttok>=1.18.1,<2;platform_system=='Linux'",
+         "pyyaml>=5.3,<5.4",
+         "rouge>=1.0,<2",
