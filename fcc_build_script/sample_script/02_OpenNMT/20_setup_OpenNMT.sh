@@ -35,6 +35,7 @@ mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. -DCMAKE_INSTAL
 make -j32 && make install
 
 cd ../bindings/python/
+pip3 install --no-cache-dir pybind11
 CFLAGS="-L${INSTALL_PATH}/.local/lib64 -I${INSTALL_PATH}/.local/include -I${INSTALL_PATH}/Tokenizer/include" python3 setup.py install
 
 # build OpenNMT-tf
@@ -48,7 +49,6 @@ python3 setup.py sdist bdist_wheel
 
 cd dist
 pip3 install --no-cache-dir OpenNMT_tf-2.11.0-py3-none-any.whl
-pip3 install --no-cache-dir pybind11
 pip3 list
 
 # make train dataset
