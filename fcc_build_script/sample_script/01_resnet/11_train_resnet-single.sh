@@ -12,6 +12,9 @@ set -ex
 
 export OMP_PROC_BIND=false
 
+export KMP_SETTINGS=1
+export KMP_BLOCKTIME=1
+
 WORK_PATH=`pwd`
 MODEL_PATH=$INSTALL_PATH/models
 cd $MODEL_PATH

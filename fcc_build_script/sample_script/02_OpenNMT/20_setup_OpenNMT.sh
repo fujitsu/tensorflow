@@ -31,7 +31,7 @@ PYONMTTOK_VERSION="v1.18.3"
 git clone https://github.com/OpenNMT/Tokenizer.git -b ${PYONMTTOK_VERSION}
 cd Tokenizer
 git submodule update --init --recursive
-mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. -DCMAKE_INSTALL_PREFIX=${INSTALL_PATH}/.local
+mkdir -p build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. -DCMAKE_INSTALL_PREFIX=${INSTALL_PATH}/.local -DLIB_ONLY=true
 make -j32 && make install
 
 cd ../bindings/python/

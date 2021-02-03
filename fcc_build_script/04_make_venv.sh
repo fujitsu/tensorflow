@@ -21,8 +21,8 @@ pip3 install --no-cache-dir cython
 BLAS=None LAPACK=None ATLAS=None pip3 install --no-cache-dir numpy==1.18.4
 CC=gcc pip3 install --no-cache-dir grpcio==1.29.0
                                          
-LAPACK=${TCSDS_PATH}/lib64/libfjlapackexsve.so
-BLAS=$LAPACK
+export LAPACK=${TCSDS_PATH}/lib64/libfjlapackexsve.so
+export BLAS=$LAPACK
 pip3 install --no-cache-dir scipy==1.4.1
 
 pip3 install $WHEEL_PATH/h5py-2.10.0-cp38-cp38-linux_aarch64.whl

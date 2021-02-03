@@ -1,6 +1,6 @@
 #!/bin/bash
 #PJM -L "rscunit=rscunit_ft01,rscgrp=ai-default"
-#PJM -L elapse=01:00:00
+#PJM -L elapse=05:00:00
 #PJM -L "node=1"
 #PJM -j
 #PJM -S
@@ -30,7 +30,7 @@ CONFIG="--config=noaws --config=nogcp --config=nohdfs --config=nonccl --distinct
 CONFIG_CC="--copt=-march=armv8.2-a+sve --copt=-O3"
 CONFIG_CPP="--cxxopt=-march=armv8.2-a+sve --cxxopt=-O3 --cxxopt=-D_GLIBCXX_USE_CXX11_ABI=0"
 
-#CONFIG_BAZEL="--verbose_failures --local_ram_resources=$((5*1024)) --local_cpu_resources=5 --jobs=5 --subcommands=pretty_print"
+#CONFIG_BAZEL="--verbose_failures --local_ram_resources=$((24*1024)) --local_cpu_resources=24 --jobs=24"
 CONFIG_BAZEL="--verbose_failures --subcommands=pretty_print"
 
 $BAZEL_BIN build ${CONFIG} ${CONFIG_CC} ${CONFIG_CPP} ${CONFIG_BAZEL}            \

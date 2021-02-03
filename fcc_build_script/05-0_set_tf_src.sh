@@ -11,7 +11,7 @@ set -ex
 
 pushd ../
 
-sed -i "26s/\/ONEDNN_DIR/${ONEDNN_DIR//\//\\\/}/g" third_party/mkl_dnn/mkldnn_v1.BUILD
-sed -i "178s/\/INSTALL_PATH/${INSTALL_PATH//\//\\\/}/g" tensorflow/workspace.bzl
+sed -i "26s/\/ONEDNN_DIR/${ONEDNN_DIR//\//\\/}/g" third_party/mkl_dnn/mkldnn_v1.BUILD
+sed -i "178s/\/INSTALL_PATH/${INSTALL_PATH//\//\\/}/g" tensorflow/workspace.bzl
 
 popd
