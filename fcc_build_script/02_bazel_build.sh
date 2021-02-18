@@ -1,6 +1,6 @@
 #!/bin/bash
 #PJM -L "rscunit=rscunit_ft01,rscgrp=ai-default"
-#PJM -L elapse=01:00:00
+#PJM -L elapse=03:00:00
 #PJM -L "node=1"
 #PJM -j
 #PJM -S
