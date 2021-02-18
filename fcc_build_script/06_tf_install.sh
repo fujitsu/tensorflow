@@ -12,6 +12,7 @@ pushd ../
 . $INSTALL_PATH/$VENV_NAME/bin/activate
 
 TF_PKG=tf_pkg
+mkdir -p $INSTALL_PATH/$TF_PKG
 
 bazel-bin/tensorflow/tools/pip_package/build_pip_package $INSTALL_PATH/$TF_PKG
 

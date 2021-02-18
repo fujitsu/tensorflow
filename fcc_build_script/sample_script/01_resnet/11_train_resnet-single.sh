@@ -25,7 +25,7 @@ INTER="-inter=1"
 #INTRA="-intra=1"
 DATA="--synth"
 CHECKPOINTDIR="resnet"
-BSIZE="--batch_size=61"
+BSIZE="--batch_size=60"
 
 TRAIN_OPT="$DATA --num_gpus=0 --max_train_steps=25 --train_epochs=1 --model_dir=${WORK_PATH}/checkpoint/${CHECKPOINTDIR} --clean $INTER $INTRA $BSIZE"
 EVAL_OPT="$DATA --num_gpus=0 --max_train_steps=25 --train_epochs=1 --model_dir=${WORK_PATH}/checkpoint/${CHECKPOINTDIR} --eval_only $INTER $INTRA $BSIZE"

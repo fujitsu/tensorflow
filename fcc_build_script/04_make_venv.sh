@@ -17,6 +17,7 @@ $INSTALL_PATH/.local/bin/python3 -m venv ./$VENV_NAME
 
 export MAX_JOBS=48
 
+pip3 install --upgrade pip
 pip3 install --no-cache-dir cython
 BLAS=None LAPACK=None ATLAS=None pip3 install --no-cache-dir numpy==1.18.4
 CC=gcc pip3 install --no-cache-dir grpcio==1.29.0

@@ -26,4 +26,10 @@ make -j48
 mv python python_org
 ${CXX} --linkfortran -SSL2 -Kopenmp -Nlibomp -o python Programs/python.o -L. -lpython3.8 -ldl  -lutil   -lm
 make install
+
+cd ${INSTALL_PATH}/.local/bin
+ln -s python3 python
+
 popd
+
+
