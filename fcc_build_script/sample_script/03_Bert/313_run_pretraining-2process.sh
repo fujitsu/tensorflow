@@ -1,7 +1,8 @@
 #!/bin/bash
 #PJM -L "rscunit=rscunit_ft01,rscgrp=ai-default"
 #PJM -L elapse=01:00:00
-#PJM -L "node=1"
+#PJM -L "node=1:noncont"
+#PJM --mpi "shape=1,proc=2"
 #PJM -j
 #PJM -S
 
@@ -13,7 +14,7 @@ set -ex
 WORK_PATH=`pwd`
 
 DATA_DIR=$WORK_PATH/pretraining_data
-MODEL_DIR=$WORK_PATH/pretraining_output
+MODEL_DIR=$WORK_PATH/pretraining_output_multi
 BERT_DIR=$WORK_PATH/cased_L-12_H-768_A-12
 
 pushd $INSTALL_PATH/Bert
@@ -28,8 +29,10 @@ if [ -d $MODEL_DIR ];then
   rm -rf $MODEL_DIR
 fi
 
-#numactl -m 6,7 -N 6,7 python run_pretraining.py  \
-python3 run_pretraining.py                       \
+MPI="mpirun -np 2"
+#MPI="mpirun --prefix /opt/FJSVstclanga/v1.1.0 --rankfile rankfile -np 2 -mca pml ob1"
+
+$MPI python3 run_pretraining.py                  \
   --input_files=$DATA_DIR/tf_examples_*.tfrecord \
   --model_dir=$MODEL_DIR                         \
   --bert_config_file=$BERT_DIR/bert_config.json  \
@@ -41,6 +44,8 @@ python3 run_pretraining.py                       \
   --warmup_steps=10                              \
   --num_steps_per_epoch=50                       \
   --steps_per_loop=1                             \
-  --log_steps=4
+  --log_steps=4                                  \
+  --use_keras_compile_fit True                   \
+  --use_horovod True
 
 popd
