@@ -1,54 +1,559 @@
+diff --git a/official/nlp/bert/input_pipeline.py b/official/nlp/bert/input_pipeline.py
+index 8b32368..a6ad3d0 100644
+--- a/official/nlp/bert/input_pipeline.py
++++ b/official/nlp/bert/input_pipeline.py
+@@ -19,7 +19,7 @@ from __future__ import division
+ from __future__ import print_function
+ 
+ import tensorflow as tf
+-
++from absl import logging
+ 
+ def decode_record(record, name_to_features):
+   """Decodes a record to a TensorFlow example."""
+@@ -58,6 +58,7 @@ def create_pretrain_dataset(input_patterns,
+                             seq_length,
+                             max_predictions_per_seq,
+                             batch_size,
++                            hvd=None,
+                             is_training=True,
+                             input_pipeline_context=None):
+   """Creates input dataset from (tf)records files for pretraining."""
+@@ -82,11 +83,16 @@ def create_pretrain_dataset(input_patterns,
+     if not tf.io.gfile.glob(input_pattern):
+       raise ValueError('%s does not match any files.' % input_pattern)
+ 
+-  dataset = tf.data.Dataset.list_files(input_patterns, shuffle=is_training)
++  dataset = tf.data.Dataset.list_files(input_patterns, shuffle=is_training, seed=0)
+ 
+-  if input_pipeline_context and input_pipeline_context.num_input_pipelines > 1:
++  if input_pipeline_context and input_pipeline_context.num_input_pipelines > 1 and not hvd:
+     dataset = dataset.shard(input_pipeline_context.num_input_pipelines,
+                             input_pipeline_context.input_pipeline_id)
++  if hvd:
++    if len(list(dataset.as_numpy_iterator())) < hvd.size():
++      logging.error("The number of processes is greater than the number of data files.") 
++      exit()
++    dataset = dataset.shard(hvd.size(), hvd.rank())
+   if is_training:
+     dataset = dataset.repeat()
+ 
+@@ -140,6 +146,7 @@ def create_pretrain_dataset(input_patterns,
+ def create_classifier_dataset(file_path,
+                               seq_length,
+                               batch_size,
++                              hvd=None,
+                               is_training=True,
+                               input_pipeline_context=None):
+   """Creates input dataset from (tf)records files for train/eval."""
+@@ -154,9 +161,11 @@ def create_classifier_dataset(file_path,
+ 
+   # The dataset is always sharded by number of hosts.
+   # num_input_pipelines is the number of hosts rather than number of cores.
+-  if input_pipeline_context and input_pipeline_context.num_input_pipelines > 1:
++  if input_pipeline_context and input_pipeline_context.num_input_pipelines > 1 and not hvd:
+     dataset = dataset.shard(input_pipeline_context.num_input_pipelines,
+                             input_pipeline_context.input_pipeline_id)
++  if is_training and hvd:
++    dataset = dataset.shard(hvd.size(), hvd.rank())
+ 
+   def _select_data_from_record(record):
+     x = {
+diff --git a/official/nlp/bert/run_classifier.py b/official/nlp/bert/run_classifier.py
+index 2734d02..d5cd10c 100644
+--- a/official/nlp/bert/run_classifier.py
++++ b/official/nlp/bert/run_classifier.py
+@@ -36,6 +36,7 @@ from official.nlp.bert import input_pipeline
+ from official.nlp.bert import model_saving_utils
+ from official.utils.misc import distribution_utils
+ from official.utils.misc import keras_utils
++import horovod.tensorflow.keras as hvd
+ 
+ 
+ flags.DEFINE_enum(
+@@ -55,6 +56,7 @@ flags.DEFINE_string(
+     'to be used for training and evaluation.')
+ flags.DEFINE_integer('train_batch_size', 32, 'Batch size for training.')
+ flags.DEFINE_integer('eval_batch_size', 32, 'Batch size for evaluation.')
++flags.DEFINE_bool('use_horovod', False, 'train with horovod')
+ 
+ common_flags.define_common_bert_flags()
+ 
+@@ -78,19 +80,28 @@ def get_loss_fn(num_classes):
+ 
+ 
+ def get_dataset_fn(input_file_pattern, max_seq_length, global_batch_size,
+-                   is_training):
++                   is_training, use_hvd=False):
+   """Gets a closure to create a dataset."""
+ 
+   def _dataset_fn(ctx=None):
+     """Returns tf.data.Dataset for distributed BERT pretraining."""
+     batch_size = ctx.get_per_replica_batch_size(
+         global_batch_size) if ctx else global_batch_size
+-    dataset = input_pipeline.create_classifier_dataset(
+-        input_file_pattern,
+-        max_seq_length,
+-        batch_size,
+-        is_training=is_training,
+-        input_pipeline_context=ctx)
++    if use_hvd and FLAGS.use_keras_compile_fit:
++      dataset = input_pipeline.create_classifier_dataset(
++          input_file_pattern,
++          max_seq_length,
++          batch_size,
++          hvd=hvd,
++          is_training=is_training,
++          input_pipeline_context=ctx)
++    else:
++      dataset = input_pipeline.create_classifier_dataset(
++          input_file_pattern,
++          max_seq_length,
++          batch_size,
++          is_training=is_training,
++          input_pipeline_context=ctx)
+     return dataset
+ 
+   return _dataset_fn
+@@ -109,6 +120,7 @@ def run_bert_classifier(strategy,
+                         init_checkpoint,
+                         train_input_fn,
+                         eval_input_fn,
++                        use_hvd=False,
+                         custom_callbacks=None,
+                         run_eagerly=False,
+                         use_keras_compile_fit=False):
+@@ -125,8 +137,14 @@ def run_bert_classifier(strategy,
+             max_seq_length,
+             hub_module_url=FLAGS.hub_module_url,
+             hub_module_trainable=FLAGS.hub_module_trainable))
+-    optimizer = optimization.create_optimizer(
+-        initial_lr, steps_per_epoch * epochs, warmup_steps)
++    if use_hvd and use_keras_compile_fit:
++      # Scale the learning rate by the number of workers refer to Horovod with Keras
++      # (https://horovod.readthedocs.io/en/stable/keras.html)
++      optimizer = optimization.create_optimizer(
++          initial_lr * hvd.size(), steps_per_epoch * epochs // hvd.size(), warmup_steps)
++    else:
++      optimizer = optimization.create_optimizer(
++          initial_lr, steps_per_epoch * epochs, warmup_steps)
+     classifier_model.optimizer = performance.configure_optimizer(
+         optimizer,
+         use_float16=common_flags.use_float16(),
+@@ -157,6 +175,7 @@ def run_bert_classifier(strategy,
+         epochs,
+         steps_per_epoch,
+         eval_steps,
++        use_hvd=use_hvd,
+         custom_callbacks=custom_callbacks)
+ 
+   # Use user-defined loop to start training.
+@@ -190,6 +209,7 @@ def run_keras_compile_fit(model_dir,
+                           epochs,
+                           steps_per_epoch,
+                           eval_steps,
++                          use_hvd=False,
+                           custom_callbacks=None):
+   """Runs BERT classifier model using Keras compile/fit API."""
+ 
+@@ -202,27 +222,50 @@ def run_keras_compile_fit(model_dir,
+     if init_checkpoint:
+       checkpoint = tf.train.Checkpoint(model=sub_model)
+       checkpoint.restore(init_checkpoint).assert_existing_objects_matched()
+-
+-    bert_model.compile(optimizer=optimizer, loss=loss_fn, metrics=[metric_fn()])
+-
+-    summary_dir = os.path.join(model_dir, 'summaries')
+-    summary_callback = tf.keras.callbacks.TensorBoard(summary_dir)
+-    checkpoint_path = os.path.join(model_dir, 'checkpoint')
+-    checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+-        checkpoint_path, save_weights_only=True)
+-
+-    if custom_callbacks is not None:
+-      custom_callbacks += [summary_callback, checkpoint_callback]
++     
++    if use_hvd:
++      optimizer = hvd.DistributedOptimizer(optimizer)
++      bert_model.compile(optimizer=optimizer, loss=loss_fn, metrics=[metric_fn()], experimental_run_tf_function=False)
++      if custom_callbacks is not None:
++        custom_callbacks += [hvd.callbacks.BroadcastGlobalVariablesCallback(0),]
++      else:
++        custom_callbacks = [hvd.callbacks.BroadcastGlobalVariablesCallback(0),]
++      if hvd.rank() == 0:
++        summary_dir = os.path.join(model_dir, 'summaries')
++        summary_callback = tf.keras.callbacks.TensorBoard(summary_dir)
++        checkpoint_path = os.path.join(model_dir, 'checkpoint')
++        checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
++            checkpoint_path, save_weights_only=True)
++        custom_callbacks += [summary_callback, checkpoint_callback]
++      steps_per_epoch = steps_per_epoch // hvd.size()
+     else:
+-      custom_callbacks = [summary_callback, checkpoint_callback]
+-
+-    bert_model.fit(
+-        x=training_dataset,
+-        validation_data=evaluation_dataset,
+-        steps_per_epoch=steps_per_epoch,
+-        epochs=epochs,
+-        validation_steps=eval_steps,
+-        callbacks=custom_callbacks)
++      bert_model.compile(optimizer=optimizer, loss=loss_fn, metrics=[metric_fn()])
++      summary_dir = os.path.join(model_dir, 'summaries')
++      summary_callback = tf.keras.callbacks.TensorBoard(summary_dir)
++      checkpoint_path = os.path.join(model_dir, 'checkpoint')
++      checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
++          checkpoint_path, save_weights_only=True)
++      if custom_callbacks is not None:
++        custom_callbacks += [summary_callback, checkpoint_callback]
++      else:
++        custom_callbacks = [summary_callback, checkpoint_callback]
++    if use_hvd:
++      bert_model.fit(
++          x=training_dataset,
++          validation_data=evaluation_dataset,
++          steps_per_epoch=steps_per_epoch,
++          epochs=epochs,
++          validation_steps=eval_steps,
++          callbacks=custom_callbacks,
++          verbose=2 if hvd.rank() == 0 else 0)
++    else:
++      bert_model.fit(
++          x=training_dataset,
++          validation_data=evaluation_dataset,
++          steps_per_epoch=steps_per_epoch,
++          epochs=epochs,
++          validation_steps=eval_steps,
++          callbacks=custom_callbacks)
+ 
+     return bert_model
+ 
+@@ -323,6 +366,7 @@ def export_classifier(model_export_path, input_meta_data,
+ def run_bert(strategy,
+              input_meta_data,
+              model_config,
++             use_hvd=False,
+              train_input_fn=None,
+              eval_input_fn=None):
+   """Run BERT training."""
+@@ -374,6 +418,7 @@ def run_bert(strategy,
+       FLAGS.init_checkpoint,
+       train_input_fn,
+       eval_input_fn,
++      use_hvd=use_hvd,
+       run_eagerly=FLAGS.run_eagerly,
+       use_keras_compile_fit=FLAGS.use_keras_compile_fit,
+       custom_callbacks=custom_callbacks)
+@@ -382,15 +427,29 @@ def run_bert(strategy,
+     # As Keras ModelCheckpoint callback used with Keras compile/fit() API
+     # internally uses model.save_weights() to save checkpoints, we must
+     # use model.load_weights() when Keras compile/fit() is used.
+-    model_saving_utils.export_bert_model(
+-        FLAGS.model_export_path,
+-        model=trained_model,
+-        restore_model_using_load_weights=FLAGS.use_keras_compile_fit)
++    if use_hvd and FLAGS.use_keras_compile_fit:
++      if hvd.rank() == 0:
++        model_saving_utils.export_bert_model(
++            FLAGS.model_export_path,
++            model=trained_model,
++            restore_model_using_load_weights=FLAGS.use_keras_compile_fit)
++    else:
++      model_saving_utils.export_bert_model(
++          FLAGS.model_export_path,
++          model=trained_model,
++          restore_model_using_load_weights=FLAGS.use_keras_compile_fit)
++
+   return trained_model
+ 
+ 
+ def main(_):
+   # Users should always run this script under TF 2.x
++  use_hvd = FLAGS.use_horovod
++  if use_hvd and not FLAGS.use_keras_compile_fit:
++    logging.error("Please make sure 'use_keras_compile_fit' is True if you want to run `BERT` with horovod.")
++    exit()
++  if use_hvd and FLAGS.use_keras_compile_fit:
++    hvd.init()
+ 
+   with tf.io.gfile.GFile(FLAGS.input_meta_data_path, 'rb') as reader:
+     input_meta_data = json.loads(reader.read().decode('utf-8'))
+@@ -407,7 +466,8 @@ def main(_):
+       FLAGS.train_data_path,
+       max_seq_length,
+       FLAGS.train_batch_size,
+-      is_training=True)
++      is_training=True,
++      use_hvd=use_hvd)
+   eval_input_fn = get_dataset_fn(
+       FLAGS.eval_data_path,
+       max_seq_length,
+@@ -415,7 +475,7 @@ def main(_):
+       is_training=False)
+ 
+   bert_config = bert_configs.BertConfig.from_json_file(FLAGS.bert_config_file)
+-  run_bert(strategy, input_meta_data, bert_config, train_input_fn,
++  run_bert(strategy, input_meta_data, bert_config, use_hvd, train_input_fn,
+            eval_input_fn)
+ 
+ 
 diff --git a/official/nlp/bert/run_pretraining.py b/official/nlp/bert/run_pretraining.py
-index b7d28fb4..f904b9f1 100644
+index b7d28fb..49c44a5 100644
 --- a/official/nlp/bert/run_pretraining.py
 +++ b/official/nlp/bert/run_pretraining.py
-@@ -31,7 +31,7 @@ from official.nlp.bert import common_flags
+@@ -17,6 +17,10 @@ from __future__ import absolute_import
+ from __future__ import division
+ from __future__ import print_function
+ 
++import json
++import math
++import os
++
+ from absl import app
+ from absl import flags
+ from absl import logging
+@@ -29,9 +33,11 @@ from official.nlp import optimization
+ from official.nlp.bert import bert_models
+ from official.nlp.bert import common_flags
  from official.nlp.bert import configs
++from official.nlp.bert import model_saving_utils
  from official.nlp.bert import input_pipeline
  from official.utils.misc import distribution_utils
 -
 +from official.utils.misc import keras_utils
++import horovod.tensorflow.keras as hvd
  
  flags.DEFINE_string('input_files', None,
                      'File path to retrieve training data for pre-training.')
-@@ -48,7 +48,6 @@ flags.DEFINE_integer('num_steps_per_epoch', 1000,
+@@ -48,6 +54,7 @@ flags.DEFINE_integer('num_steps_per_epoch', 1000,
                       'Total number of training steps to run per epoch.')
  flags.DEFINE_float('warmup_steps', 10000,
                     'Warmup steps for Adam weight decay optimizer.')
--
++flags.DEFINE_bool('use_horovod', False, 'train with horovod')
+ 
  common_flags.define_common_bert_flags()
  common_flags.define_gin_flags()
+@@ -56,19 +63,30 @@ FLAGS = flags.FLAGS
  
-@@ -94,13 +93,13 @@ def run_customized_training(strategy,
-                             initial_lr,
-                             warmup_steps,
-                             input_files,
+ 
+ def get_pretrain_dataset_fn(input_file_pattern, seq_length,
+-                            max_predictions_per_seq, global_batch_size):
++                            max_predictions_per_seq, global_batch_size, use_hvd=False):
+   """Returns input dataset from input file string."""
+   def _dataset_fn(ctx=None):
+     """Returns tf.data.Dataset for distributed BERT pretraining."""
+     input_patterns = input_file_pattern.split(',')
+-    batch_size = ctx.get_per_replica_batch_size(global_batch_size)
+-    train_dataset = input_pipeline.create_pretrain_dataset(
+-        input_patterns,
+-        seq_length,
+-        max_predictions_per_seq,
+-        batch_size,
+-        is_training=True,
+-        input_pipeline_context=ctx)
++    batch_size = ctx.get_per_replica_batch_size(
++            global_batch_size) if ctx else global_batch_size
++    if use_hvd:
++      train_dataset = input_pipeline.create_pretrain_dataset(
++          input_patterns,
++          seq_length,
++          max_predictions_per_seq,
++          batch_size,
++          hvd=hvd,
++          is_training=True,
++          input_pipeline_context=ctx)
++    else:
++      train_dataset = input_pipeline.create_pretrain_dataset(
++          input_patterns,
++          seq_length,
++          max_predictions_per_seq,
++          batch_size,
++          is_training=True,
++          input_pipeline_context=ctx)
+     return train_dataset
+ 
+   return _dataset_fn
+@@ -82,38 +100,66 @@ def get_loss_fn():
+ 
+   return _bert_pretrain_loss_fn
+ 
+-
+-def run_customized_training(strategy,
+-                            bert_config,
+-                            max_seq_length,
+-                            max_predictions_per_seq,
+-                            model_dir,
+-                            steps_per_epoch,
+-                            steps_per_loop,
+-                            epochs,
+-                            initial_lr,
+-                            warmup_steps,
+-                            input_files,
 -                            train_batch_size):
-+                            train_batch_size,
-+                            custom_callbacks=None):
++def run_bert_pretrain(strategy,
++                      bert_config,
++                      max_seq_length,
++                      max_predictions_per_seq,
++                      model_dir,
++                      steps_per_epoch,
++                      steps_per_loop,
++                      epochs,
++                      initial_lr,
++                      init_checkpoint,
++                      warmup_steps,
++                      input_files,
++                      train_batch_size,
++                      use_hvd=False,
++                      custom_callbacks=None,
++                      use_keras_compile_fit=False):
    """Run BERT pretrain model training using low-level API."""
  
    train_input_fn = get_pretrain_dataset_fn(input_files, max_seq_length,
                                             max_predictions_per_seq,
-                                            train_batch_size)
+-                                           train_batch_size)
 -
++                                           train_batch_size, use_hvd=use_hvd)
    def _get_pretrain_model():
      """Gets a pretraining model."""
      pretrain_model, core_model = bert_models.pretrain_model(
-@@ -123,7 +122,8 @@ def run_customized_training(strategy,
+         bert_config, max_seq_length, max_predictions_per_seq)
+-    optimizer = optimization.create_optimizer(
+-        initial_lr, steps_per_epoch * epochs, warmup_steps)
++    if use_hvd and use_keras_compile_fit:
++      # Scale the learning rate by the number of workers refer to Horovod with Keras
++      # (https://horovod.readthedocs.io/en/stable/keras.html)
++      optimizer = optimization.create_optimizer(
++          initial_lr * hvd.size(), steps_per_epoch * epochs // hvd.size(), warmup_steps)
++    else:
++      optimizer = optimization.create_optimizer(
++          initial_lr, steps_per_epoch * epochs, warmup_steps)
+     pretrain_model.optimizer = performance.configure_optimizer(
+         optimizer,
+         use_float16=common_flags.use_float16(),
+         use_graph_rewrite=common_flags.use_graph_rewrite())
+     return pretrain_model, core_model
+ 
+-  trained_model = model_training_utils.run_customized_training_loop(
++  if use_keras_compile_fit:
++    # Start training using Keras compile/fit API.
++    logging.info('Training using TF 2.0 Keras compile/fit API with '
++                 'distribution strategy.')
++    return run_keras_compile_fit(
++        model_dir,
++        strategy,
++        _get_pretrain_model,
++        train_input_fn,
++        get_loss_fn(),
++        init_checkpoint,
++        epochs,
++        steps_per_epoch,
++        use_hvd=use_hvd,
++        custom_callbacks=custom_callbacks)
++
++  # Runs customized training loop.
++  logging.info('Training using customized training loop TF 2.0 with distrubuted'
++               'strategy.')
++
++  return model_training_utils.run_customized_training_loop(
+       strategy=strategy,
+       model_fn=_get_pretrain_model,
+       loss_fn=get_loss_fn(),
+@@ -123,25 +169,105 @@ def run_customized_training(strategy,
        steps_per_epoch=steps_per_epoch,
        steps_per_loop=steps_per_loop,
        epochs=epochs,
 -      sub_model_export_name='pretrained/bert_model')
 +      sub_model_export_name='pretrained/bert_model',
-+      custom_callbacks=custom_callbacks)
++      custom_callbacks=custom_callbacks,)
  
-   return trained_model
+-  return trained_model
  
-@@ -138,6 +138,14 @@ def run_bert_pretrain(strategy):
-   # Runs customized training loop.
-   logging.info('Training using customized training loop TF 2.0 with distrubuted'
-                'strategy.')
++def run_keras_compile_fit(model_dir,
++                          strategy,
++                          model_fn,
++                          train_input_fn,
++                          loss_fn,
++                          init_checkpoint,
++                          epochs,
++                          steps_per_epoch,
++                          use_hvd=False,
++                          custom_callbacks=None):
++  """Runs BERT pretraining model using Keras compile/fit API."""
++
++  with strategy.scope():
++    training_dataset = train_input_fn()
++    bert_model, sub_model = model_fn()
++    optimizer = bert_model.optimizer
++
++    if init_checkpoint:
++      checkpoint = tf.train.Checkpoint(model=sub_model)
++      checkpoint.restore(init_checkpoint).assert_existing_objects_matched()
++
++    if use_hvd:
++      optimizer = hvd.DistributedOptimizer(optimizer)
++      bert_model.compile(optimizer=optimizer, loss=loss_fn, experimental_run_tf_function=False)
++      if custom_callbacks is not None:
++        custom_callbacks += [hvd.callbacks.BroadcastGlobalVariablesCallback(0),]
++      else:
++        custom_callbacks = [hvd.callbacks.BroadcastGlobalVariablesCallback(0),]
++      if hvd.rank() == 0:
++        summary_dir = os.path.join(model_dir, 'summaries')
++        summary_callback = tf.keras.callbacks.TensorBoard(summary_dir)
++        checkpoint_path = os.path.join(model_dir, 'checkpoint')
++        checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
++            checkpoint_path, save_weights_only=True)
++        custom_callbacks += [summary_callback, checkpoint_callback]
++      steps_per_epoch = steps_per_epoch // hvd.size()
++    else:
++      bert_model.compile(optimizer=optimizer, loss=loss_fn)
+ 
+-def run_bert_pretrain(strategy):
++      summary_dir = os.path.join(model_dir, 'summaries')
++      summary_callback = tf.keras.callbacks.TensorBoard(summary_dir)
++      checkpoint_path = os.path.join(model_dir, 'checkpoint')
++      checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
++          checkpoint_path, save_weights_only=True)
++
++      if custom_callbacks is not None:
++        custom_callbacks += [summary_callback, checkpoint_callback]
++      else:
++        custom_callbacks = [summary_callback, checkpoint_callback]
++
++    ckpt = tf.train.Checkpoint(model=sub_model)
++    ckpt_path = os.path.join(model_dir, 'pretrained_model/bert_model.ckpt')
++
++    if use_hvd:
++      bert_model.fit(
++          x=training_dataset,
++          epochs=epochs,
++          steps_per_epoch=steps_per_epoch,
++          callbacks=custom_callbacks,
++          verbose=2 if hvd.rank() == 0 else 0)
++      if hvd.rank() == 0:
++        checkpoint.save(ckpt_path)
++    else:
++      bert_model.fit(
++          x=training_dataset,
++          epochs=epochs,
++          steps_per_epoch=steps_per_epoch,
++          callbacks=custom_callbacks)
++      checkpoint.save(ckpt_path)
++
++    return bert_model
++
++
++def run_bert(strategy, use_hvd=False):
+   """Runs BERT pre-training."""
+ 
++  keras_utils.set_config_v2(FLAGS.enable_xla)
++  performance.set_mixed_precision_policy(common_flags.dtype())
++
+   bert_config = configs.BertConfig.from_json_file(FLAGS.bert_config_file)
+   if not strategy:
+     raise ValueError('Distribution strategy is not specified.')
+ 
+-  # Runs customized training loop.
+-  logging.info('Training using customized training loop TF 2.0 with distrubuted'
+-               'strategy.')
 +  if FLAGS.log_steps:
 +    custom_callbacks = [keras_utils.TimeHistory(
 +        batch_size=FLAGS.train_batch_size,
@@ -60,13 +565,44 @@ index b7d28fb4..f904b9f1 100644
  
    performance.set_mixed_precision_policy(common_flags.dtype())
  
-@@ -153,7 +161,8 @@ def run_bert_pretrain(strategy):
+-  return run_customized_training(
++  trained_model = run_bert_pretrain(
+       strategy,
+       bert_config,
+       FLAGS.max_seq_length,
+@@ -151,13 +277,24 @@ def run_bert_pretrain(strategy):
+       FLAGS.steps_per_loop,
+       FLAGS.num_train_epochs,
        FLAGS.learning_rate,
++      FLAGS.init_checkpoint,
        FLAGS.warmup_steps,
        FLAGS.input_files,
 -      FLAGS.train_batch_size)
 +      FLAGS.train_batch_size,
++      use_hvd=use_hvd,
++      use_keras_compile_fit=FLAGS.use_keras_compile_fit,
 +      custom_callbacks=custom_callbacks)
++  return trained_model
  
  
  def main(_):
+   # Users should always run this script under TF 2.x
++  use_hvd = FLAGS.use_horovod
++  if use_hvd and not FLAGS.use_keras_compile_fit:
++    logging.error("Please make sure `use_keras_compile_fit` is `True` if you want to run `BERT` with horovod.")
++    exit()
++  if use_hvd and FLAGS.use_keras_compile_fit:
++    hvd.init()
+   gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+   if not FLAGS.model_dir:
+     FLAGS.model_dir = '/tmp/bert20/'
+@@ -168,8 +305,7 @@ def main(_):
+   if strategy:
+     print('***** Number of cores used : ', strategy.num_replicas_in_sync)
+ 
+-  run_bert_pretrain(strategy)
+-
++  run_bert(strategy, use_hvd)
+ 
+ if __name__ == '__main__':
+   app.run(main)

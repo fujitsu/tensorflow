@@ -1,6 +1,6 @@
 *****************************************************************************************************************
 Documentation :
-  TensorFlow for A64FX (2021/2/1)
+  TensorFlow for A64FX (fujitsu_v2.2.0L02_for_a64fx 2021/2/24)
 *****************************************************************************************************************
 
 0. Target node
@@ -14,11 +14,18 @@ Documentation :
   2-1. Checkout from Repository.
           # git clone https://github.com/fujitsu/tensorflow.git
           # cd tensorflow
-          # git checkout -b fujitsu_v2.2.0_for_a64fx origin/fujitsu_v2.2.0_for_a64fx
+          # git checkout -b fujitsu_v2.2.0L02_for_a64fx fujitsu_v2.2.0L02_for_a64fx
 
   2-2. Environment Setting
 
           # cd fcc_build_script
+
+      Make directory(with any name)
+        - to install TensorFlow environment
+        - temporary directory
+
+          # mkdir -p /home/user/work/tf_env
+          # mkdir -p ~/pytemp
 
       Modify the following environment variables in "env.src".
 
@@ -28,10 +35,12 @@ Documentation :
           ## PREFIX       : The directory where this file is located.
           ## TCSDS_PATH   : TCS installation path
           ## INSTALL_PATH : The directory to install TensorFlow environment
+          ## TMPDIR       : The temporary directory
           ################################################
           export PREFIX=/home/user/work/tensorflow/fcc_build_script
-          export TCSDS_PATH=/opt/FJSVxtclanga/tcsds-1.2.27a
+          export TCSDS_PATH=/opt/FJSVxtclanga/tcsds-1.2.30a
           export INSTALL_PATH=/home/user/work/tf_env
+          export TMPDIR=~/pytemp
           ```
 
       Modify each batch files to suit your environment.
@@ -152,7 +161,9 @@ Documentation :
 
     2. Run the sample programs
         # pjsub 312_run_pretraining.sh
+        # pjsub 313_run_pretraining-2process.sh
         # pjsub 322_run_finetuning.sh
+        # pjsub 323_run_finetuning-2process.sh
 
         Example of output(J312_run_pretraining.sh.xxx.out)
         ```

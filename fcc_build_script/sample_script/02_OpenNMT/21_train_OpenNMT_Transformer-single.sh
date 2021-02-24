@@ -11,10 +11,10 @@ run_transformer () {
   . ../../env.src
   . $INSTALL_PATH/$VENV_NAME/bin/activate
 
-  export OMP_NUM_THREADS=9
-  export OMP_PROC_BIND=FALSE
-  export TF_NUM_INTEROP_THREADS=2
-  export TF_NUM_INTRAOP_THREADS=24
+  export OMP_NUM_THREADS=22
+  export KMP_AFFINITY=granularity=fine,compact,1,0
+  export TF_NUM_INTEROP_THREADS=1
+  export TF_NUM_INTRAOP_THREADS=22
 
   export KMP_SETTINGS=1
   export KMP_BLOCKTIME=1

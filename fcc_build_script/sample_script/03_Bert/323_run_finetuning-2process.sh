@@ -1,7 +1,8 @@
 #!/bin/bash
 #PJM -L "rscunit=rscunit_ft01,rscgrp=ai-default"
 #PJM -L elapse=01:00:00
-#PJM -L "node=1"
+#PJM -L "node=1:noncont"
+#PJM --mpi "shape=1,proc=2"
 #PJM -j
 #PJM -S
 
@@ -14,7 +15,7 @@ WORK_PATH=`pwd`
 
 BERT_DIR=$WORK_PATH/cased_L-12_H-768_A-12
 GLUE_DIR=$WORK_PATH/finetuning_glue_data
-MODEL_DIR=$WORK_PATH/finetuning_output
+MODEL_DIR=$WORK_PATH/finetuning_output_multi
 TASK=MRPC
 
 pushd $INSTALL_PATH/Bert
@@ -29,8 +30,10 @@ if [ -d $MODEL_DIR ];then
   rm -rf $MODEL_DIR
 fi
 
-#numactl -m 6,7 -N 6,7 python3 run_classifier.py                          \
-python3 run_classifier.py                                                 \
+MPI="mpirun -np 2"
+#MPI="mpirun --prefix /opt/FJSVstclanga/v1.1.0 --rankfile rankfile -np 2 -mca pml ob1"
+
+$MPI python3 run_classifier.py                                            \
   --mode='train_and_eval'                                                 \
   --input_meta_data_path=${GLUE_DIR}/glue_data/${TASK}/${TASK}_meta_data  \
   --train_data_path=${GLUE_DIR}/glue_data/${TASK}/${TASK}_train.tf_record \
@@ -45,6 +48,7 @@ python3 run_classifier.py                                                 \
   --model_dir=${MODEL_DIR}                                                \
   --distribution_strategy=mirrored                                        \
   --log_steps=10                                                          \
-  --use_keras_compile_fit True
+  --use_keras_compile_fit True                                            \
+  --use_horovod True
 
 popd
