@@ -7,8 +7,8 @@
 
 . ./env.src
 
-export CC="fcc -Nclang -Kfast -Knolargepage"
-export CXX="FCC -Nclang -Kfast -Knolargepage"
+export CC="fcc -Nclang -Kfast -Knolargepage -lpthread"
+export CXX="FCC -Nclang -Kfast -Knolargepage -lpthread"
 export OPT=-O3
 export ac_cv_opt_olimit_ok=no
 export ac_cv_olimit_ok=no
