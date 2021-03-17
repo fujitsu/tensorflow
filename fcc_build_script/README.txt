@@ -14,7 +14,7 @@ Documentation :
   2-1. Checkout from Repository.
           # git clone https://github.com/fujitsu/tensorflow.git
           # cd tensorflow
-          # git checkout -b fujitsu_v2.2.0L02_for_a64fx fujitsu_v2.2.0L02_for_a64fx
+          # git checkout -b fujitsu_v2.2.0_for_a64fx origin/fujitsu_v2.2.0_for_a64fx
 
   2-2. Environment Setting
 
@@ -180,4 +180,5 @@ Documentation :
        ```
  
 # Copyright
+  Copyright RIKEN LIMITED 2021
   Copyright FUJITSU LIMITED 2021

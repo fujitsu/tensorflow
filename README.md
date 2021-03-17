@@ -1,3 +1,8 @@
+This repository provides TensorFlow tuned for A64FX.
+The modifications to this branch are copyrighted by RIKEN and FUJITSU.
+
+Please See the [wiki](https://github.com/fujitsu/tensorflow/wiki/TensorFlow-oneDNN-build-manual-for-FUJITSU-Software-Compiler-Package-(TensorFlow-v2.2.0)) for details.
+
 <div align="center">
   <img src="https://www.tensorflow.org/images/tf_logo_social.png">
 </div>
