@@ -1,6 +1,6 @@
 *****************************************************************************************************************
 Documentation :
-  TensorFlow for A64FX (fujitsu_v2.2.0L02_for_a64fx 2021/2/24)
+  TensorFlow for A64FX (fujitsu_v2.2.0L03_for_a64fx 2021/3/31)
 *****************************************************************************************************************
 
 0. Target node
@@ -152,7 +152,7 @@ Documentation :
         ~
         ```
 
-  4-1. BERT(supported only single process)
+  4-3. BERT
     1. Download and setup sample programs
         # cd sample_script/03_Bert
         # pjsub 300_setup_bert.sh
@@ -178,7 +178,43 @@ Documentation :
         99/917 [==>...........................] - ETA: 13:03 - test_accuracy: 0.7096 - loss: 0.6098I0128 13:09:37.908488 281473617147888 keras_utils.py:119] TimeHistory: 9.62 seconds, 4.16 examples/second between steps 90 and 100
         ~
        ```
- 
+
+  4-4. Mask-R-CNN
+    1. Download and setup sample programs
+        # cd sample_script/04_Mask-R-CNN
+        # pjsub 40_setup_mask-r-cnn.sh
+
+    2. Download and setup training data set(coco)
+        # bash 41-0_download_traindata.sh
+        # pjsub 41-1_setup_traindata.sh
+
+        notice : Estimated download and setup time
+        - Download(41-0_download_traindata.sh)
+          Approximately 1 ~ 2 hours (Total ~ 20 GB)
+        - Setup(41-1_setup_traindata.sh)
+          Approximately 6 ~ 8 hours
+
+    3. Run the sample programs
+        # pjsub 42_train_maskrcnn_single.sh
+        # pjsub 43_train_maskrcnn_multi.sh
+
+        Example of output(42_train_maskrcnn_single.sh.xxx.out)
+        ~
+        ```
+        INFO:tensorflow:Step 1 per-step time 285.174s loss=9.171
+        INFO:tensorflow:Step 2 per-step time 6.340s loss=9.243
+        INFO:tensorflow:Step 3 per-step time 6.073s loss=9.192
+        INFO:tensorflow:Step 4 per-step time 6.023s loss=11.505
+        INFO:tensorflow:Step 5 per-step time 5.996s loss=8.521
+        INFO:tensorflow:Step 6 per-step time 6.048s loss=8.329
+        INFO:tensorflow:Step 7 per-step time 6.091s loss=8.076
+        INFO:tensorflow:Step 8 per-step time 6.047s loss=7.469
+        INFO:tensorflow:Step 9 per-step time 6.002s loss=7.147
+        INFO:tensorflow:Step 10 per-step time 6.001s loss=7.067
+        INFO:tensorflow:Step 11 per-step time 6.063s loss=6.634
+        ~
+        ```
+
 # Copyright
   Copyright RIKEN LIMITED 2021
   Copyright FUJITSU LIMITED 2021

@@ -43,7 +43,8 @@ run_maskrcnn_multi () {
   export MPI_RANK=${OMPI_COMM_WORLD_RANK}
   export MPI_SIZE=${OMPI_COMM_WORLD_SIZE}
 
-  MPIRUN="mpirun --allow-run-as-root --map-by slot:PE=${CORE_PER_PROC}"
+  #MPIRUN="mpirun --allow-run-as-root --map-by slot:PE=${CORE_PER_PROC}"
+  MPIRUN="mpirun"
 
   export BATCH_SIZE=${BATCH_SIZE:=4}
 
@@ -52,7 +53,7 @@ run_maskrcnn_multi () {
 
   export USE_HOROVOD="--use_horovod"
 
-  ${MPIRUN} -np $NPROC --display-map \
+  ${MPIRUN} -np $NPROC \
     python3 model_main_tf2.py \
        ${USE_HOROVOD} \
 	     --model_dir=${MODEL_DIR} \

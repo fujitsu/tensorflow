@@ -34,9 +34,10 @@ run_maskrcnn () {
   export KMP_AFFINITY=granularity=fine,scatter,1,0
 
   export BATCH_SIZE=${BATCH_SIZE:=2}
-  NUMACTL="numactl -m 2,3 -N 2,3"
+  #NUMACTL="numactl -m 4,5 -N 4,5"
 
-  ${NUMACTL} python3 model_main_tf2.py \
+  #${NUMACTL} python3 model_main_tf2.py \
+  python3 model_main_tf2.py \
 	   --model_dir=${MODEL_DIR} \
 	   --num_train_steps=20 \
 	   --sample_1_of_n_eval_examples=1 \
