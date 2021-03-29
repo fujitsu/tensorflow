@@ -19,6 +19,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/resize_bilinear_op.h"
 
 #include <memory>
+#include <omp.h>
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
@@ -319,6 +320,13 @@ struct ResizeBilinearGrad<CPUDevice, T> {
     //                     + top_right    * (1 - y) *      x
     //                     + bottom_left  *      y  * (1 - x)
     //                     + bottom_right *      y  *      x
+    int num_threads = 1;
+    int max_threads = omp_get_max_threads();
+    if (batch > max_threads)
+      num_threads = max_threads;
+    else
+      num_threads = batch;
+    #pragma omp parallel for num_threads(num_threads)
     for (Eigen::Index b = 0; b < batch; ++b) {
       for (Eigen::Index y = 0; y < resized_height; ++y) {
         const float in_y = scaler(y, height_scale);

@@ -30,6 +30,8 @@ limitations under the License.
 #include "tensorflow/core/platform/test.h"
 #include "tensorflow/core/public/session_options.h"
 
+#include <random>
+
 namespace tensorflow {
 enum class TestDevice { CPU, GPU };
 
@@ -543,4 +545,583 @@ INSTANTIATE_TEST_SUITE_P(ResizeBilinearOpAlignCornersTestGpu,
                          ResizeBilinearOpAlignCornersTest,
                          ::testing::Values(TestDevice::GPU));
 #endif  // GOOGLE_CUDA
+
+class ResizeBilinearGradOpTestBase
+    : public OpsTestBase,
+      public ::testing::WithParamInterface<TestDevice> {
+ protected:
+  explicit ResizeBilinearGradOpTestBase()
+      : align_corners_(false), half_pixel_centers_(false) {}
+
+  void MakeOp(bool align_corners=false, bool half_pixel_centers=false) {
+    align_corners_ = align_corners;
+    half_pixel_centers_ = half_pixel_centers;
+
+    TF_EXPECT_OK(NodeDefBuilder("resize_bilinear_grad_op", "ResizeBilinearGrad")
+                     .Input(FakeInput(DT_FLOAT))
+                     .Input(FakeInput(DT_FLOAT))
+                     .Attr("align_corners", align_corners)
+                     .Attr("half_pixel_centers", half_pixel_centers)
+                     .Finalize(node_def()));
+    TF_EXPECT_OK(InitOp());
+  }
+
+  // CalculateResizeScale determines the float scaling factor.
+  inline float CalculateResizeScale(int64 in_size, int64 out_size) {
+    return (align_corners_ && out_size > 1)
+              ? (in_size - 1) / static_cast<float>(out_size - 1)
+              : in_size / static_cast<float>(out_size);
+  }
+
+  // Half pixel scaler scales assuming that the pixel centers are at 0.5, i.e. the
+  // floating point coordinates of the top,left pixel is 0.5,0.5.
+  inline float HalfPixelScaler(const int x, const float scale) const {
+      // Note that we subtract 0.5 from the return value, as the existing bilinear
+      // sampling code etc assumes pixels are in the old coordinate system.
+      return (static_cast<float>(x) + 0.5f) * scale - 0.5f;
+  }
+
+  // Older incorrect scaling method that causes all resizes to have a slight
+  // translation leading to inconsistent results. For example, a flip then a
+  // resize gives different results then a resize then a flip.
+  inline float LegacyScaler(const int x, const float scale) const {
+      return static_cast<float>(x) * scale;
+  }
+
+  void ResizeGradCoreSingle(typename TTypes<float, 4>::ConstTensor input_grad,
+                            const float height_scale, const float width_scale,
+                            typename TTypes<float, 4>::Tensor output_grad) {
+    const Eigen::Index batch = output_grad.dimension(0);
+    const Eigen::Index original_height = output_grad.dimension(1);
+    const Eigen::Index original_width = output_grad.dimension(2);
+    const Eigen::Index channels = output_grad.dimension(3);
+
+    const Eigen::Index resized_height = input_grad.dimension(1);
+    const Eigen::Index resized_width = input_grad.dimension(2);
+
+    output_grad.setZero();
+
+    // Each resized output pixel was computed as a weighted average of four
+    // input pixels. Here we find the four input pixel locations that
+    // contributed to each output pixel and propagate the gradient at the output
+    // pixel location to each of those four input pixel locations in the same
+    // proportions that they originally contributed to the output pixel.
+    // Here is the forward-propagation pseudo-code, for reference:
+    // resized(b, y, x, c) = top_left     * (1 - y) * (1 - x)
+    //                     + top_right    * (1 - y) *      x
+    //                     + bottom_left  *      y  * (1 - x)
+    //                     + bottom_right *      y  *      x
+    for (Eigen::Index b = 0; b < batch; ++b) {
+      for (Eigen::Index y = 0; y < resized_height; ++y) {
+        const float in_y = half_pixel_centers_ ? HalfPixelScaler(y, height_scale)
+                                               : LegacyScaler(y, height_scale);
+        const Eigen::Index top_y_index =
+            std::max(static_cast<Eigen::Index>(floorf(in_y)),
+                     static_cast<Eigen::Index>(0));
+        const Eigen::Index bottom_y_index = std::min(
+            static_cast<Eigen::Index>(ceilf(in_y)), original_height - 1);
+        const float y_lerp = in_y - floorf(in_y);
+        const float inverse_y_lerp = (1.0f - y_lerp);
+        for (Eigen::Index x = 0; x < resized_width; ++x) {
+          const float in_x = half_pixel_centers_ ? HalfPixelScaler(x, width_scale)
+                                                 : LegacyScaler(x, width_scale);
+          const Eigen::Index left_x_index =
+              std::max(static_cast<Eigen::Index>(floorf(in_x)),
+                       static_cast<Eigen::Index>(0));
+          const Eigen::Index right_x_index = std::min(
+              static_cast<Eigen::Index>(ceilf(in_x)), original_width - 1);
+          const float x_lerp = in_x - floorf(in_x);
+          const float inverse_x_lerp = (1.0f - x_lerp);
+          for (Eigen::Index c = 0; c < channels; ++c) {
+            output_grad(b, top_y_index, left_x_index, c) +=
+                float(input_grad(b, y, x, c) * inverse_y_lerp * inverse_x_lerp);
+            output_grad(b, top_y_index, right_x_index, c) +=
+                float(input_grad(b, y, x, c) * inverse_y_lerp * x_lerp);
+            output_grad(b, bottom_y_index, left_x_index, c) +=
+                float(input_grad(b, y, x, c) * y_lerp * inverse_x_lerp);
+            output_grad(b, bottom_y_index, right_x_index, c) +=
+                float(input_grad(b, y, x, c) * y_lerp * x_lerp);
+          }
+        }
+      }
+    }
+  }
+
+  void RunFloatTest(bool align_corners, bool half_pixel_centers,
+                    int batch, int in_height, int in_width,
+                    int out_height,int out_width,  int channels) {
+
+    MakeOp(align_corners, half_pixel_centers);
+
+    // set input data 1
+    AddInput<float>(TensorShape({batch, in_height, in_width, channels}),
+                    [](int x) {return float(rand())/(RAND_MAX/10) - 5.0;});
+
+    // set input data 2
+    AddInput<float>(TensorShape({batch, out_height, out_width, channels}),
+                    [](int x) {return float(rand())/(RAND_MAX/10) - 5.0;});
+
+    // run OpKernel
+    TF_ASSERT_OK(RunOpKernel());
+
+    // make expected data(by single process)
+    Tensor expected(allocator(), DT_FLOAT, TensorShape({batch, out_height, out_width, channels}));
+
+    TTypes<float, 4>::ConstTensor input_grad = GetInput(0).tensor<float, 4>();
+    typename TTypes<float, 4>::Tensor output_grad(expected.tensor<float, 4>());
+
+    int64 resized_height = GetInput(0).dim_size(1);
+    int64 resized_width = GetInput(0).dim_size(2);
+    int64 original_height = GetInput(1).dim_size(1);
+    int64 original_width = GetInput(1).dim_size(2);
+
+    float height_scale = CalculateResizeScale(original_height, resized_height);
+    float width_scale = CalculateResizeScale(original_width, resized_width);
+
+    ResizeGradCoreSingle(input_grad, height_scale, width_scale, output_grad);
+
+    // prepare value
+    test::ExpectTensorNear<float>(expected, *GetOutput(0), 0.01);
+  }
+
+  bool align_corners_;
+  bool half_pixel_centers_;
+};    // ResizeBilinearGradOpTestBase
+
+class ResizeBilinearGradOpTest : public ResizeBilinearGradOpTestBase {
+ public:
+  ResizeBilinearGradOpTest() {}
+};
+TEST_F(ResizeBilinearGradOpTest, test_1) {
+  RunFloatTest(false, false, 12, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_2) {
+  RunFloatTest(false, false, 12, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_3) {
+  RunFloatTest(false, false, 12, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_4) {
+  RunFloatTest(false, false, 12, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_5) {
+  RunFloatTest(false, false, 12, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_6) {
+  RunFloatTest(false, false, 12, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_7) {
+  RunFloatTest(false, false, 24, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_8) {
+  RunFloatTest(false, false, 24, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_9) {
+  RunFloatTest(false, false, 24, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_10) {
+  RunFloatTest(false, false, 24, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_11) {
+  RunFloatTest(false, false, 24, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_12) {
+  RunFloatTest(false, false, 24, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_13) {
+  RunFloatTest(false, false, 48, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_14) {
+  RunFloatTest(false, false, 48, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_15) {
+  RunFloatTest(false, false, 48, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_16) {
+  RunFloatTest(false, false, 48, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_17) {
+  RunFloatTest(false, false, 48, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_18) {
+  RunFloatTest(false, false, 48, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_19) {
+  RunFloatTest(false, false, 64, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_20) {
+  RunFloatTest(false, false, 64, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_21) {
+  RunFloatTest(false, false, 64, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_22) {
+  RunFloatTest(false, false, 64, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_23) {
+  RunFloatTest(false, false, 64, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_24) {
+  RunFloatTest(false, false, 64, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_25) {
+  RunFloatTest(false, false, 128, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_26) {
+  RunFloatTest(false, false, 128, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_27) {
+  RunFloatTest(false, false, 128, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_28) {
+  RunFloatTest(false, false, 128, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_29) {
+  RunFloatTest(false, false, 128, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_30) {
+  RunFloatTest(false, false, 128, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_31) {
+  RunFloatTest(false, false, 256, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_32) {
+  RunFloatTest(false, false, 256, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_33) {
+  RunFloatTest(false, false, 256, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_34) {
+  RunFloatTest(false, false, 256, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_35) {
+  RunFloatTest(false, false, 256, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_36) {
+  RunFloatTest(false, false, 256, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_37) {
+  RunFloatTest(false, true, 12, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_38) {
+  RunFloatTest(false, true, 12, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_39) {
+  RunFloatTest(false, true, 12, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_40) {
+  RunFloatTest(false, true, 12, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_41) {
+  RunFloatTest(false, true, 12, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_42) {
+  RunFloatTest(false, true, 12, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_43) {
+  RunFloatTest(false, true, 24, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_44) {
+  RunFloatTest(false, true, 24, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_45) {
+  RunFloatTest(false, true, 24, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_46) {
+  RunFloatTest(false, true, 24, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_47) {
+  RunFloatTest(false, true, 24, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_48) {
+  RunFloatTest(false, true, 24, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_49) {
+  RunFloatTest(false, true, 48, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_50) {
+  RunFloatTest(false, true, 48, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_51) {
+  RunFloatTest(false, true, 48, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_52) {
+  RunFloatTest(false, true, 48, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_53) {
+  RunFloatTest(false, true, 48, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_54) {
+  RunFloatTest(false, true, 48, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_55) {
+  RunFloatTest(false, true, 64, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_56) {
+  RunFloatTest(false, true, 64, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_57) {
+  RunFloatTest(false, true, 64, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_58) {
+  RunFloatTest(false, true, 64, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_59) {
+  RunFloatTest(false, true, 64, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_60) {
+  RunFloatTest(false, true, 64, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_61) {
+  RunFloatTest(false, true, 128, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_62) {
+  RunFloatTest(false, true, 128, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_63) {
+  RunFloatTest(false, true, 128, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_64) {
+  RunFloatTest(false, true, 128, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_65) {
+  RunFloatTest(false, true, 128, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_66) {
+  RunFloatTest(false, true, 128, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_67) {
+  RunFloatTest(false, true, 256, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_68) {
+  RunFloatTest(false, true, 256, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_69) {
+  RunFloatTest(false, true, 256, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_70) {
+  RunFloatTest(false, true, 256, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_71) {
+  RunFloatTest(false, true, 256, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_72) {
+  RunFloatTest(false, true, 256, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_73) {
+  RunFloatTest(true, false, 12, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_74) {
+  RunFloatTest(true, false, 12, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_75) {
+  RunFloatTest(true, false, 12, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_76) {
+  RunFloatTest(true, false, 12, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_77) {
+  RunFloatTest(true, false, 12, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_78) {
+  RunFloatTest(true, false, 12, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_79) {
+  RunFloatTest(true, false, 24, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_80) {
+  RunFloatTest(true, false, 24, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_81) {
+  RunFloatTest(true, false, 24, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_82) {
+  RunFloatTest(true, false, 24, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_83) {
+  RunFloatTest(true, false, 24, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_84) {
+  RunFloatTest(true, false, 24, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_85) {
+  RunFloatTest(true, false, 48, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_86) {
+  RunFloatTest(true, false, 48, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_87) {
+  RunFloatTest(true, false, 48, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_88) {
+  RunFloatTest(true, false, 48, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_89) {
+  RunFloatTest(true, false, 48, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_90) {
+  RunFloatTest(true, false, 48, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_91) {
+  RunFloatTest(true, false, 64, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_92) {
+  RunFloatTest(true, false, 64, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_93) {
+  RunFloatTest(true, false, 64, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_94) {
+  RunFloatTest(true, false, 64, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_95) {
+  RunFloatTest(true, false, 64, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_96) {
+  RunFloatTest(true, false, 64, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_97) {
+  RunFloatTest(true, false, 128, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_98) {
+  RunFloatTest(true, false, 128, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_99) {
+  RunFloatTest(true, false, 128, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_100) {
+  RunFloatTest(true, false, 128, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_101) {
+  RunFloatTest(true, false, 128, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_102) {
+  RunFloatTest(true, false, 128, 3, 3, 9, 9, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_103) {
+  RunFloatTest(true, false, 256, 64, 64, 32, 32, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_104) {
+  RunFloatTest(true, false, 256, 64, 64, 32, 32, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_105) {
+  RunFloatTest(true, false, 256, 33, 33, 1, 1, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_106) {
+  RunFloatTest(true, false, 256, 33, 33, 1, 1, 1024);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_107) {
+  RunFloatTest(true, false, 256, 3, 3, 9, 9, 128);
+}
+
+TEST_F(ResizeBilinearGradOpTest, test_108) {
+  RunFloatTest(true, false, 256, 3, 3, 9, 9, 1024);
+}
+
 }  // namespace tensorflow

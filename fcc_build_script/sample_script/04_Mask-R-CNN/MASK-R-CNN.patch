@@ -1,0 +1,528 @@
+diff --git a/research/object_detection/builders/dataset_builder.py b/research/object_detection/builders/dataset_builder.py
+index f0dd3002..2d9fe929 100644
+--- a/research/object_detection/builders/dataset_builder.py
++++ b/research/object_detection/builders/dataset_builder.py
+@@ -31,7 +31,9 @@ import tensorflow.compat.v1 as tf
+ 
+ from object_detection.builders import decoder_builder
+ from object_detection.protos import input_reader_pb2
++from object_detection.utils import tf_version
+ 
++import horovod.tensorflow as hvd
+ 
+ def make_initializable_iterator(dataset):
+   """Creates an iterator, and initializes tables.
+@@ -95,12 +97,11 @@ def _read_dataset_internal(file_read_func,
+     filename_dataset = filename_shard_fn(filename_dataset)
+ 
+   filename_dataset = filename_dataset.repeat(config.num_epochs or None)
+-  records_dataset = filename_dataset.apply(
+-      tf.data.experimental.parallel_interleave(
+-          file_read_func,
+-          cycle_length=num_readers,
+-          block_length=config.read_block_length,
+-          sloppy=config.shuffle))
++  records_dataset = filename_dataset.interleave(
++      file_read_func,
++      cycle_length=num_readers,
++      block_length=config.read_block_length,
++      num_parallel_calls=config.num_parallel_map_calls)
+   if config.shuffle:
+     records_dataset = records_dataset.shuffle(config.shuffle_buffer_size)
+   return records_dataset
+@@ -164,7 +165,7 @@ def shard_function_for_context(input_context):
+ 
+ 
+ def build(input_reader_config, batch_size=None, transform_input_data_fn=None,
+-          input_context=None, reduce_to_frame_fn=None):
++          input_context=None, reduce_to_frame_fn=None, use_horovod=False):
+   """Builds a tf.data.Dataset.
+ 
+   Builds a tf.data.Dataset by applying the `transform_input_data_fn` on all
+@@ -212,7 +213,7 @@ def build(input_reader_config, batch_size=None, transform_input_data_fn=None,
+       Returns:
+         A tf.data.Dataset mapped with fn_to_map.
+       """
+-      if hasattr(dataset, 'map_with_legacy_function'):
++      if hasattr(dataset, 'map_with_legacy_function') and tf_version.is_tf1():
+         if batch_size:
+           num_parallel_calls = batch_size * (
+               input_reader_config.num_parallel_batches)
+@@ -221,11 +222,21 @@ def build(input_reader_config, batch_size=None, transform_input_data_fn=None,
+         dataset = dataset.map_with_legacy_function(
+             fn_to_map, num_parallel_calls=num_parallel_calls)
+       else:
+-        dataset = dataset.map(fn_to_map, tf.data.experimental.AUTOTUNE)
++        dataset = dataset.map(fn_to_map,
++                              num_parallel_calls=input_reader_config.num_parallel_map_calls)
+       return dataset
+-    shard_fn = shard_function_for_context(input_context)
++
++    if not use_horovod:
++      shard_fn = shard_function_for_context(input_context)
++    else:
++      shard_fn = lambda ds : ds.shard(hvd.size(), hvd.rank())
++
+     if input_context is not None:
+       batch_size = input_context.get_per_replica_batch_size(batch_size)
++
++    if use_horovod:
++      batch_size = batch_size // hvd.size()
++
+     dataset = read_dataset(
+         functools.partial(tf.data.TFRecordDataset, buffer_size=8 * 1000 * 1000),
+         config.input_path[:], input_reader_config, filename_shard_fn=shard_fn)
+@@ -245,6 +256,13 @@ def build(input_reader_config, batch_size=None, transform_input_data_fn=None,
+       dataset = dataset.batch(batch_size,
+                               drop_remainder=input_reader_config.drop_remainder)
+     dataset = dataset.prefetch(input_reader_config.num_prefetch_batches)
++
++    if tf_version.is_tf2():
++        options = tf.compat.v2.data.Options()
++        options.experimental_threading.max_intra_op_parallelism = 1
++        options.experimental_threading.private_threadpool_size = 1
++        dataset = dataset.with_options(options)
++
+     return dataset
+ 
+   raise ValueError('Unsupported input_reader_config.')
+diff --git a/research/object_detection/inputs.py b/research/object_detection/inputs.py
+index 544c367c..17c305bc 100644
+--- a/research/object_detection/inputs.py
++++ b/research/object_detection/inputs.py
+@@ -733,7 +733,8 @@ def create_train_input_fn(train_config, train_input_config,
+ 
+ 
+ def train_input(train_config, train_input_config,
+-                model_config, model=None, params=None, input_context=None):
++                model_config, model=None, params=None, input_context=None,
++                use_horovod=False):
+   """Returns `features` and `labels` tensor dictionaries for training.
+ 
+   Args:
+@@ -867,7 +868,8 @@ def train_input(train_config, train_input_config,
+       transform_input_data_fn=transform_and_pad_input_data_fn,
+       batch_size=params['batch_size'] if params else train_config.batch_size,
+       input_context=input_context,
+-      reduce_to_frame_fn=reduce_to_frame_fn)
++      reduce_to_frame_fn=reduce_to_frame_fn,
++      use_horovod=use_horovod)
+   return dataset
+ 
+ 
+diff --git a/research/object_detection/model_lib_v2.py b/research/object_detection/model_lib_v2.py
+index beb10be5..a6dfdfd1 100644
+--- a/research/object_detection/model_lib_v2.py
++++ b/research/object_detection/model_lib_v2.py
+@@ -36,6 +36,7 @@ from object_detection.utils import label_map_util
+ from object_detection.utils import ops
+ from object_detection.utils import visualization_utils as vutils
+ 
++import horovod.tensorflow as hvd
+ 
+ MODEL_BUILD_UTIL_MAP = model_lib.MODEL_BUILD_UTIL_MAP
+ 
+@@ -151,7 +152,8 @@ def eager_train_step(detection_model,
+                      add_regularization_loss=True,
+                      clip_gradients_value=None,
+                      global_step=None,
+-                     num_replicas=1.0):
++                     num_replicas=1.0,
++                     use_horovod=False):
+   """Process a single training batch.
+ 
+   This method computes the loss for the model on a single training batch,
+@@ -247,10 +249,14 @@ def eager_train_step(detection_model,
+     total_loss = losses_dict['Loss/total_loss']
+ 
+     # Normalize loss for num replicas
+-    total_loss = tf.math.divide(total_loss,
+-                                tf.constant(num_replicas, dtype=tf.float32))
++    if not use_horovod:
++        total_loss = tf.math.divide(total_loss,
++                                    tf.constant(num_replicas, dtype=tf.float32))
+     losses_dict['Loss/normalized_total_loss'] = total_loss
+ 
++  if use_horovod:
++      tape = hvd.DistributedGradientTape(tape)
++
+   for loss_type in losses_dict:
+     tf.compat.v2.summary.scalar(
+         loss_type, losses_dict[loss_type], step=global_step)
+@@ -262,6 +268,13 @@ def eager_train_step(detection_model,
+   if clip_gradients_value:
+     gradients, _ = tf.clip_by_global_norm(gradients, clip_gradients_value)
+   optimizer.apply_gradients(zip(gradients, trainable_variables))
++
++  if use_horovod:
++      if int(global_step.value()) == 0:
++          tf.logging.info('Variables are broadcasted at first step.')
++          hvd.broadcast_variables(detection_model.variables, root_rank=0)
++          hvd.broadcast_variables(optimizer.variables(), root_rank=0)
++
+   tf.compat.v2.summary.scalar('learning_rate', learning_rate, step=global_step)
+   tf.compat.v2.summary.image(
+       name='train_input_images',
+@@ -304,7 +317,7 @@ def is_object_based_checkpoint(checkpoint_path):
+ 
+ def load_fine_tune_checkpoint(
+     model, checkpoint_path, checkpoint_type, checkpoint_version, input_dataset,
+-    unpad_groundtruth_tensors):
++    unpad_groundtruth_tensors, use_horovod=False):
+   """Load a fine tuning classification or detection checkpoint.
+ 
+   To make sure the model variables are all built, this method first executes
+@@ -355,19 +368,22 @@ def load_fine_tune_checkpoint(
+         features,
+         labels)
+ 
+-  strategy = tf.compat.v2.distribute.get_strategy()
+-  if hasattr(tf.distribute.Strategy, 'run'):
+-    strategy.run(
+-        _dummy_computation_fn, args=(
+-            features,
+-            labels,
+-        ))
++  if use_horovod:
++    _dummy_computation_fn(features, labels)
+   else:
+-    strategy.experimental_run_v2(
+-        _dummy_computation_fn, args=(
+-            features,
+-            labels,
+-        ))
++    strategy = tf.compat.v2.distribute.get_strategy()
++    if hasattr(tf.distribute.Strategy, 'run'):
++      strategy.run(
++          _dummy_computation_fn, args=(
++              features,
++              labels,
++          ))
++    else:
++      strategy.experimental_run_v2(
++          _dummy_computation_fn, args=(
++              features,
++              labels,
++          ))
+ 
+   restore_from_objects_dict = model.restore_from_objects(
+       fine_tune_checkpoint_type=checkpoint_type)
+@@ -387,12 +403,19 @@ def get_filepath(strategy, filepath):
+     A temporary filepath for non-chief workers to use or the original filepath
+     for the chief.
+   """
+-  if strategy.extended.should_checkpoint:
+-    return filepath
++  if strategy:
++    if strategy.extended.should_checkpoint:
++      return filepath
++    else:
++      # TODO(vighneshb) Replace with the public API when TF exposes it.
++      task_id = strategy.extended._task_id  # pylint:disable=protected-access
++      return os.path.join(filepath, 'temp_worker_{:03d}'.format(task_id))
+   else:
+-    # TODO(vighneshb) Replace with the public API when TF exposes it.
+-    task_id = strategy.extended._task_id  # pylint:disable=protected-access
+-    return os.path.join(filepath, 'temp_worker_{:03d}'.format(task_id))
++    if hvd.rank() == 0:
++      return filepath
++    else:
++      task_id = hvd.rank()  # pylint:disable=protected-access
++      return os.path.join(filepath, 'temp_worker_{:03d}'.format(task_id))
+ 
+ 
+ def clean_temporary_directories(strategy, filepath):
+@@ -404,9 +427,14 @@ def clean_temporary_directories(strategy, filepath):
+     strategy: A tf.distribute.Strategy object.
+     filepath: The filepath for the temporary directory.
+   """
+-  if not strategy.extended.should_checkpoint:
+-    if tf.io.gfile.exists(filepath) and tf.io.gfile.isdir(filepath):
+-      tf.io.gfile.rmtree(filepath)
++  if strategy:
++    if not strategy.extended.should_checkpoint:
++      if tf.io.gfile.exists(filepath) and tf.io.gfile.isdir(filepath):
++        tf.io.gfile.rmtree(filepath)
++  else:
++    if hvd.rank() != 0:
++      if tf.io.gfile.exists(filepath) and tf.io.gfile.isdir(filepath):
++        tf.io.gfile.rmtree(filepath)
+ 
+ 
+ def train_loop(
+@@ -415,6 +443,8 @@ def train_loop(
+     config_override=None,
+     train_steps=None,
+     use_tpu=False,
++    use_horovod=False,
++    enable_profile=False,
+     save_final_config=False,
+     checkpoint_every_n=1000,
+     checkpoint_max_to_keep=7,
+@@ -451,6 +481,7 @@ def train_loop(
+     record_summaries: Boolean, whether or not to record summaries.
+     **kwargs: Additional keyword arguments for configuration override.
+   """
++
+   ## Parse the configs
+   get_configs_from_pipeline_file = MODEL_BUILD_UTIL_MAP[
+       'get_configs_from_pipeline_file']
+@@ -498,8 +529,14 @@ def train_loop(
+     config_util.save_pipeline_config(pipeline_config_final, model_dir)
+ 
+   # Build the model, optimizer, and training input
+-  strategy = tf.compat.v2.distribute.get_strategy()
+-  with strategy.scope():
++  if not use_horovod:
++      strategy = tf.compat.v2.distribute.get_strategy()
++      scope_fn = strategy.scope
++  else:
++      strategy = None
++      scope_fn = lambda : tf.name_scope("horovod")
++
++  with scope_fn():
+     detection_model = MODEL_BUILD_UTIL_MAP['detection_model_fn_base'](
+         model_config=model_config, is_training=True)
+ 
+@@ -515,9 +552,23 @@ def train_loop(
+       train_input = train_input.repeat()
+       return train_input
+ 
+-    train_input = strategy.experimental_distribute_datasets_from_function(
+-        train_dataset_fn)
++    def train_dataset_fn_horovod():
++      """Callable to create train input."""
++      # Create the inputs.
++      train_input = inputs.train_input(
++          train_config=train_config,
++          train_input_config=train_input_config,
++          model_config=model_config,
++          model=detection_model,
++          use_horovod=use_horovod)
++      train_input = train_input.repeat()
++      return train_input
+ 
++    if use_horovod:
++      train_input = train_dataset_fn_horovod()
++    else:
++      train_input = strategy.experimental_distribute_datasets_from_function(
++          train_dataset_fn)
+ 
+     global_step = tf.Variable(
+         0, trainable=False, dtype=tf.compat.v2.dtypes.int64, name='global_step',
+@@ -549,7 +600,7 @@ def train_loop(
+     num_steps_per_iteration = 1
+ 
+   with summary_writer.as_default():
+-    with strategy.scope():
++    with scope_fn():
+       with tf.compat.v2.summary.record_if(
+           lambda: global_step % num_steps_per_iteration == 0):
+         # Load a fine-tuning checkpoint.
+@@ -559,14 +610,19 @@ def train_loop(
+                                     fine_tune_checkpoint_type,
+                                     fine_tune_checkpoint_version,
+                                     train_input,
+-                                    unpad_groundtruth_tensors)
++                                    unpad_groundtruth_tensors,
++                                    use_horovod)
+ 
+         ckpt = tf.compat.v2.train.Checkpoint(
+             step=global_step, model=detection_model, optimizer=optimizer)
+ 
+         manager_dir = get_filepath(strategy, model_dir)
+-        if not strategy.extended.should_checkpoint:
+-          checkpoint_max_to_keep = 1
++        if strategy:
++            if not strategy.extended.should_checkpoint:
++                checkpoint_max_to_keep = 1
++        else:
++            if hvd.rank() != 0:
++                checkpoint_max_to_keep = 1
+         manager = tf.compat.v2.train.CheckpointManager(
+             ckpt, manager_dir, max_to_keep=checkpoint_max_to_keep)
+ 
+@@ -588,22 +644,32 @@ def train_loop(
+               add_regularization_loss=add_regularization_loss,
+               clip_gradients_value=clip_gradients_value,
+               global_step=global_step,
+-              num_replicas=strategy.num_replicas_in_sync)
++              num_replicas=hvd.size()
++              if use_horovod
++              else strategy.num_replicas_in_sync,
++              use_horovod=use_horovod
++          )
+           global_step.assign_add(1)
+           return loss
+ 
+         def _sample_and_train(strategy, train_step_fn, data_iterator):
+           features, labels = data_iterator.next()
+-          if hasattr(tf.distribute.Strategy, 'run'):
+-            per_replica_losses = strategy.run(
+-                train_step_fn, args=(features, labels))
++          if use_horovod:
++            # Note: if using horovod, only show loss with rank=0
++            per_replica_losses = train_step_fn(features, labels)
+           else:
+-            per_replica_losses = strategy.experimental_run_v2(
+-                train_step_fn, args=(features, labels))
+-          # TODO(anjalisridhar): explore if it is safe to remove the
+-          ## num_replicas scaling of the loss and switch this to a ReduceOp.Mean
+-          return strategy.reduce(tf.distribute.ReduceOp.SUM,
+-                                 per_replica_losses, axis=None)
++            if hasattr(tf.distribute.Strategy, 'run'):
++              per_replica_losses = strategy.run(
++                  train_step_fn, args=(features, labels))
++            else:
++              per_replica_losses = strategy.experimental_run_v2(
++                  train_step_fn, args=(features, labels))
++
++            # TODO(anjalisridhar): explore if it is safe to remove the
++            # num_replicas scaling of the loss and switch this to a ReduceOp.Mean
++            return strategy.reduce(tf.distribute.ReduceOp.SUM,
++                                   per_replica_losses, axis=None)
++          return per_replica_losses
+ 
+         @tf.function
+         def _dist_train_step(data_iterator):
+@@ -629,7 +695,20 @@ def train_loop(
+         for _ in range(global_step.value(), train_steps,
+                        num_steps_per_iteration):
+ 
+-          loss = _dist_train_step(train_input_iter)
++          if int(global_step.value()) == 10:
++            profile_time = time.time() # skip first 10 steps
++
++          if int(global_step.value()) == 10 and enable_profile:
++            if strategy and hasattr(strategy.extended, '_task_id'):
++                strategy_rank = strategy.extended._task_id
++            else:
++                strategy_rank = None
++            rank = hvd.rank() if use_horovod else strategy_rank
++            profile_dir = os.path.join(f"{model_dir}", f"rank{rank}") if rank else model_dir
++            with tf2.profiler.experimental.Profile(profile_dir):
++              loss = _dist_train_step(train_input_iter)
++          else:
++              loss = _dist_train_step(train_input_iter)
+ 
+           time_taken = time.time() - last_step_time
+           last_step_time = time.time()
+@@ -638,7 +717,7 @@ def train_loop(
+               'steps_per_sec', num_steps_per_iteration * 1.0 / time_taken,
+               step=global_step)
+ 
+-          if global_step.value() - logged_step >= 100:
++          if global_step.value() - logged_step >= 1:
+             tf.logging.info(
+                 'Step {} per-step time {:.3f}s loss={:.3f}'.format(
+                     global_step.value(), time_taken / num_steps_per_iteration,
+@@ -650,6 +729,11 @@ def train_loop(
+             manager.save()
+             checkpointed_step = int(global_step.value())
+ 
++        if int(global_step.value()) > 10:
++          average_time = (last_step_time - profile_time) / (int(global_step.value()) - 10)
++          tf.logging.info(f'Avg per-step time {average_time:.3f}s '
++                          f'Avg per-step batch {train_config.batch_size/average_time:.3f}')
++
+   # Remove the checkpoint directories of the non-chief workers that
+   # MultiWorkerMirroredStrategy forces us to save during sync distributed
+   # training.
+diff --git a/research/object_detection/model_main_tf2.py b/research/object_detection/model_main_tf2.py
+index 0cf05303..45645894 100644
+--- a/research/object_detection/model_main_tf2.py
++++ b/research/object_detection/model_main_tf2.py
+@@ -31,6 +31,12 @@ from absl import flags
+ import tensorflow.compat.v2 as tf
+ from object_detection import model_lib_v2
+ 
++import horovod.tensorflow as hvd
++import numpy as np
++import random
++import os
++import json
++
+ flags.DEFINE_string('pipeline_config_path', None, 'Path to pipeline config '
+                     'file.')
+ flags.DEFINE_integer('num_train_steps', None, 'Number of train steps.')
+@@ -68,13 +74,30 @@ flags.DEFINE_boolean('record_summaries', True,
+                      ('Whether or not to record summaries during'
+                       ' training.'))
+ 
++flags.DEFINE_integer('batch_size', None, 'Number of batch size.')
++flags.DEFINE_boolean('profile', False, 'Enable Profiling. Results are Dumped'
++                     ' to model_dir.')
++flags.DEFINE_boolean('use_horovod', False, 'Use horovod for Distributed Training.')
++flags.DEFINE_integer('seed', 2020, 'Random seed')
++
++
+ FLAGS = flags.FLAGS
+ 
+ 
++def set_seed(seed):
++    tf.compat.v1.set_random_seed(seed)
++    tf.compat.v2.random.set_seed(seed)
++    np.random.seed(seed)
++    random.seed(seed)
++
++
+ def main(unused_argv):
+   flags.mark_flag_as_required('model_dir')
+   flags.mark_flag_as_required('pipeline_config_path')
+   tf.config.set_soft_device_placement(True)
++  set_seed(FLAGS.seed)
++  logger = tf.get_logger()
++  logger.propagate = False
+ 
+   if FLAGS.checkpoint_dir:
+     model_lib_v2.eval_continuously(
+@@ -96,18 +119,40 @@ def main(unused_argv):
+       tf.tpu.experimental.initialize_tpu_system(resolver)
+       strategy = tf.distribute.experimental.TPUStrategy(resolver)
+     elif FLAGS.num_workers > 1:
+-      strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
++        if FLAGS.use_horovod:
++            hvd.init()
++            tf.compat.v1.logging.info(
++              f'rank={hvd.rank()} Use horovod for distributed training.'
++            )
++            strategy = None
++        else:
++            with open(os.environ['TF_CONFIG_PATH']) as f:
++              tf_config_json = json.load(f)
++              tf_config_json["task"]["index"] = os.environ['MPI_RANK']
++
++            os.environ['TF_CONFIG'] = json.dumps(tf_config_json)
++            strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
++            tf.compat.v1.logging.info(
++              f'rank={strategy.extended._task_id} Use '
++              f'MultiWorkerMirroredStrategy for distributed training.'
++            )
+     else:
+       strategy = tf.compat.v2.distribute.MirroredStrategy()
+ 
+-    with strategy.scope():
+-      model_lib_v2.train_loop(
+-          pipeline_config_path=FLAGS.pipeline_config_path,
+-          model_dir=FLAGS.model_dir,
+-          train_steps=FLAGS.num_train_steps,
+-          use_tpu=FLAGS.use_tpu,
+-          checkpoint_every_n=FLAGS.checkpoint_every_n,
+-          record_summaries=FLAGS.record_summaries)
++    scope_fn = strategy.scope if strategy else lambda : tf.name_scope("horovod")
++
++    with scope_fn():
++        model_lib_v2.train_loop(
++            pipeline_config_path=FLAGS.pipeline_config_path,
++            model_dir=FLAGS.model_dir,
++            train_steps=FLAGS.num_train_steps,
++            use_tpu=FLAGS.use_tpu,
++            use_horovod=FLAGS.use_horovod,
++            enable_profile=FLAGS.profile,
++            checkpoint_every_n=FLAGS.checkpoint_every_n,
++            record_summaries=FLAGS.record_summaries,
++            batch_size=FLAGS.batch_size)
++
+ 
+ if __name__ == '__main__':
+   tf.compat.v1.app.run()

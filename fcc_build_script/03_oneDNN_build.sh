@@ -13,8 +13,8 @@ pushd $INSTALL_PATH
 
 git clone http://github.com/fujitsu/oneDNN
 cd oneDNN
-# checkout fj_main branch
-git checkout e4d94da85c977fa1271758872683718539554a2c
+# checkout v2.1.0L01_aarch64
+git checkout v2.1.0L01_aarch64
 git submodule update --init --recursive
 
 DNNL_BUILD_DIR=${INSTALL_PATH}/oneDNN/build
